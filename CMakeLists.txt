@@ -310,14 +310,38 @@ endif()
 # _C extension
 #
 
-set(VLLM_EXT_SRC
-  "csrc/cuda_view.cu"
-  "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
-  "csrc/quantization/activation_kernels.cu"
-  "csrc/cuda_utils_kernels.cu"
-  "csrc/custom_all_reduce.cu"
-  "csrc/torch_bindings.cpp"
-  "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
+# activation_kernels.cu uses bf16 packed intrinsics that CUDA only exposes
+# for __CUDA_ARCH__ >= 800. When the requested architectures are all
+# pre-Hopper (e.g. an SM70-only Volta build), exclude the file: its
+# deep_gemm fp8 paths are runtime-dead on those architectures anyway.
+set(_VLLM_HAS_SM80 OFF)
+if(CMAKE_CUDA_ARCHITECTURES)
+  foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+    string(REGEX REPLACE "[^0-9].*$" "" _arch_num "${_arch}")
+    if(_arch_num GREATER_EQUAL 80)
+      set(_VLLM_HAS_SM80 ON)
+    endif()
+  endforeach()
+endif()
+
+if(_VLLM_HAS_SM80)
+  set(VLLM_EXT_SRC
+    "csrc/cuda_view.cu"
+    "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
+    "csrc/quantization/activation_kernels.cu"
+    "csrc/cuda_utils_kernels.cu"
+    "csrc/custom_all_reduce.cu"
+    "csrc/torch_bindings.cpp"
+    "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
+else()
+  set(VLLM_EXT_SRC
+    "csrc/cuda_view.cu"
+    "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
+    "csrc/cuda_utils_kernels.cu"
+    "csrc/custom_all_reduce.cu"
+    "csrc/torch_bindings.cpp"
+    "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
+endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_EXT_SRC

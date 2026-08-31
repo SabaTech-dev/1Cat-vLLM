@@ -328,10 +328,45 @@ __host__ __device__ __forceinline__ bool is_32byte_aligned(const void* ptr) {
 // Packed type conversion and arithmetic
 // ============================================================
 
+// ============================================================
+// SM70 (Volta) fallbacks: CUDA gates the bf16 packed intrinsics
+// (__bfloat1622float2 / __float22bfloat162_rn / __hmul2) to
+// __CUDA_ARCH__ >= 800. These bit-exact emulations compile on any
+// architecture (bf16 -> fp32 is an exact mantissa shift; the pack
+// performs round-to-nearest-even).
+// ============================================================
+__device__ __forceinline__ float vec_bf16_to_f32(const __nv_bfloat16 h) {
+  __nv_bfloat16_raw r = *reinterpret_cast<const __nv_bfloat16_raw*>(&h);
+  return __uint_as_float(((unsigned)r.x) << 16);
+}
+
+__device__ __forceinline__ __nv_bfloat16 vec_f32_to_bf16_rn(const float f) {
+  unsigned u = __float_as_uint(f);
+  u += 0x7fffu + ((u >> 16) & 1u);  // round-to-nearest-even
+  __nv_bfloat16_raw r;
+  r.x = (unsigned short)(u >> 16);
+  return *reinterpret_cast<__nv_bfloat16*>(&r);
+}
+
+__device__ __forceinline__ float2 vec_bf162_to_float2(const __nv_bfloat162 v) {
+  return make_float2(vec_bf16_to_f32(v.x), vec_bf16_to_f32(v.y));
+}
+
+__device__ __forceinline__ __nv_bfloat162 vec_float2_to_bf162_rn(const float2 f) {
+  __nv_bfloat162 r;
+  r.x = vec_f32_to_bf16_rn(f.x);
+  r.y = vec_f32_to_bf16_rn(f.y);
+  return r;
+}
+
 template <typename packed_t>
 __device__ __forceinline__ float2 cast_to_float2(const packed_t& val) {
   if constexpr (std::is_same_v<packed_t, __nv_bfloat162>) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    return vec_bf162_to_float2(val);
+#else
     return __bfloat1622float2(val);
+#endif
   } else if constexpr (std::is_same_v<packed_t, __half2>) {
     return __half22float2(val);
   } else if constexpr (std::is_same_v<packed_t, float2>) {
@@ -342,7 +377,11 @@ __device__ __forceinline__ float2 cast_to_float2(const packed_t& val) {
 template <typename packed_t>
 __device__ __forceinline__ packed_t cast_to_packed(const float2& val) {
   if constexpr (std::is_same_v<packed_t, __nv_bfloat162>) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    return vec_float2_to_bf162_rn(val);
+#else
     return __float22bfloat162_rn(val);
+#endif
   } else if constexpr (std::is_same_v<packed_t, __half2>) {
     return __float22half2_rn(val);
   } else if constexpr (std::is_same_v<packed_t, float2>) {
@@ -353,8 +392,17 @@ __device__ __forceinline__ packed_t cast_to_packed(const float2& val) {
 template <typename packed_t>
 __device__ __forceinline__ packed_t packed_mul(const packed_t& x,
                                                const packed_t& y) {
-  if constexpr (std::is_same_v<packed_t, __nv_bfloat162> ||
-                std::is_same_v<packed_t, __half2>) {
+  if constexpr (std::is_same_v<packed_t, __nv_bfloat162>) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    // fp32 mul of two bf16 values is exact; the RNE pack below yields the
+    // correctly-rounded bf16 product (same result as the native path).
+    return vec_float2_to_bf162_rn(
+        make_float2(vec_bf16_to_f32(x.x) * vec_bf16_to_f32(y.x),
+                    vec_bf16_to_f32(x.y) * vec_bf16_to_f32(y.y)));
+#else
+    return __hmul2(x, y);
+#endif
+  } else if constexpr (std::is_same_v<packed_t, __half2>) {
     return __hmul2(x, y);
   } else if constexpr (std::is_same_v<packed_t, float2>) {
     return make_float2(x.x * y.x, x.y * y.y);
