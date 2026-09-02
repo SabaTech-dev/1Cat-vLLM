@@ -94,3 +94,36 @@ independiente y puede intercalarse si hay ventana de GPU.
 
 - Todo lo multimodal (vllm-omni), compute fp8/NVFP4, FA2/FA3, bfloat16 tensor cores.
 - MTP de Qwen3.8-27B en TP2 vLLM: descartado con datos (−52% decode medido; ver CHANGELOG interno).
+
+## Adopciones de segunda ola (deep research 2026-09-02)
+
+Fuentes: FlashML-org/FreeToken (11.2k★), repos unslothai (fork llama.cpp,
+unsloth-zoo, notebooks), investigación drivers/eco-sistema Volta.
+
+### Sprint F6 — Prefix caching consciente de GDN + pools híbridos
+- **Diseño FreeToken** (no ejecutable en Volta — CUDA 13 — pero es la
+  referencia): `linear_state_pool` + `hybrid_radix_cache` — pools SEPARADOS
+  para estado recurrente (GDN) y KV de atención completa con radix cache.
+- El prefix caching del fork debe invalidar/reusar TAMBIÉN el estado
+  lineal (no solo el KV paginado) en modelos híbridos Qwen3.8.
+- **Semantic anchor checkpoints**: checkpoints de estado por fronteras
+  semánticas (tool calls, bloques de razonamiento) — edits agénticos sin
+  recomputar el prefill de 256K.
+
+### Sprint F7 — Elastic memory manager
+- Reasignación de VRAM en runtime entre caché de expertos y KV sin
+  reiniciar (patrón FreeToken). En TP2 V100 32 GB + contextos 256K, la
+  frontera KV/caché es la palanca de capacidad más grande.
+
+### Sprint F8 — Iteración y toolchain (transversal)
+- `compile_cache.py` de unsloth-zoo: caché persistente de torch.compile
+  entre sesiones para acelerar el ciclo de desarrollo del fork.
+- Toolchain fijada: CUDA 12.9 (último 12.x; 13.x eliminó sm_70) +
+  `TORCH_CUDA_ARCH_LIST="7.0"` + driver R580 (LTSB hasta jun-2028, la
+  rama final con Volta; NO migrar a 595/610).
+- Triton: main exige CC 8.0+ — pinear 3.x con binarios sm_70 para el
+  Sprint F1 (atención Triton autocontenida).
+
+### Nota llama.cpp de producción (fuera de los dos repos, acción registrada)
+- Cherry-pick del pin #144 de unslothai/llama.cpp (MTP Qwen3.8-Flash-Next).
+- Fix de una línea: `GGML_CUDA_ENABLE_UNIFIED_MEMORY=0` (pin #149).
