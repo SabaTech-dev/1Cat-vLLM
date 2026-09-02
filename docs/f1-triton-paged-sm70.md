@@ -106,12 +106,26 @@ TRITON_INTERPRET=1 python -m pytest \
     tests/v1/attention/test_triton_paged_kernels_cpu.py -v
 ```
 
+## E2E en V100 (2026-09-02, cierre del punto 1)
+
+Servido Qwen/Qwen3-0.6B fp16 (CUDA_VISIBLE_DEVICES=1, junto a la carga
+productiva, ~2.6 GB) con `--attention-backend TRITON_PAGED`,
+`--enforce-eager`, sin CUDA Graphs.
+
+**Primer intento: salida corrupta desde el primer token.** Sonda
+standalone con tensores contiguos: kernels correctos (prefill 3e-4).
+Con las vistas `kv_cache.unbind(1)` que entrega el engine (no
+contiguas, stride de bloque 2x): prefill max_diff 1.585 (basura).
+Raiz: los kernels asumian caches contiguos (cero parametros de
+stride). Fix en `a327d45b7` (strides explicitos en los 3 kernels).
+
+**Post-fix**: greedy byte-identico a FLASH_ATTN_V100 en prompt corto
+("La capital de Francia es París") y largo (72 tokens). Ambos
+backends arrancaron junto a la carga productiva sin impacto.
+
 ## Qué queda (orden propuesto)
 
-1. **Prueba funcional end-to-end en V100**: servir un modelo fp16
-   (p. ej. Qwen3-0.6B) con `--attention-backend TRITON_PAGED`, sin
-   CUDA Graphs, y comparar salida frente a `FLASH_ATTN_V100` sobre los
-   mismos prompts.
+1. ~~**Prueba funcional end-to-end en V100**~~ (HECHA 2026-09-02: paridad greedy byte-identica vs FLASH_ATTN_V100 tras el fix de strides a327d45b7).
 2. **CUDA Graphs**: el builder niega el soporte. Habilitarlo exige
    buffers de captura con padding y launches seguras para grafos.
 3. **Autotuning**: `BLOCK_M/BLOCK_N` fijos por head_dim (32/64 en 128).
