@@ -274,7 +274,9 @@ def paged_decode_attention(
     if not query.is_contiguous():
         query = query.contiguous()
 
-    BLOCK_N = 64 if head_dim <= 128 else 32
+    # Tuned on V100 (f1-autotune, 2026-09-02): BN=128 wins for head_dim<=128
+    # at every batch/seq-len combo probed (up to -30% at 4k contexts).
+    BLOCK_N = 128 if head_dim <= 128 else 32
     grid = (num_seqs, num_heads)
     _paged_decode_attention_kernel[grid](
         output,
@@ -464,13 +466,13 @@ def varlen_paged_prefill_attention(
     if not query.is_contiguous():
         query = query.contiguous()
 
-    # Conservative tile sizes; SM70 (Volta) has 64KB of shared memory per
-    # SM and Triton allocates fp16 operand staging plus fp32 accumulators.
-    # TODO(f1): autotune BLOCK_M/BLOCK_N per head_dim on V100.
+    # Tuned on V100 (f1-autotune, 2026-09-02): large M tiles spill the
+    # 64KB of shared memory and collapse (BM=64 is 18x slower than BM=16
+    # at head_dim 128). BM=16/BN=64 is the fastest pairing probed.
     if head_dim <= 64:
-        BLOCK_M, BLOCK_N = 64, 64
+        BLOCK_M, BLOCK_N = 16, 64
     elif head_dim <= 128:
-        BLOCK_M, BLOCK_N = 32, 64
+        BLOCK_M, BLOCK_N = 16, 64
     else:
         BLOCK_M, BLOCK_N = 16, 32
 
