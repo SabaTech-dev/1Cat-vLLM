@@ -128,9 +128,7 @@ backends arrancaron junto a la carga productiva sin impacto.
 1. ~~**Prueba funcional end-to-end en V100**~~ (HECHA 2026-09-02: paridad greedy byte-identica vs FLASH_ATTN_V100 tras el fix de strides a327d45b7).
 2. **CUDA Graphs**: el builder niega el soporte. Habilitarlo exige
    buffers de captura con padding y launches seguras para grafos.
-3. **Autotuning**: `BLOCK_M/BLOCK_N` fijos por head_dim (32/64 en 128).
-   Medir y sintonizar en V100; considerar partir el bucle KV en el
-   bloque diagonal para saltar tiles totalmente enmascarados.
+3. ~~**Autotuning**~~ (HECHO 2026-09-02: decode BN=128, prefill BM=16/BN=64; datos en f1-autotune.json). Queda opcional: partir el bucle KV en el bloque diagonal.
 4. **Rendimiento decode**: el kernel decode es 1 fila por programa; si
    el batch pequeño deja la GPU ociosa, evaluar split-K (varios
    programas por secuencia + reducción) como `TRITON_ATTN`.
@@ -143,6 +141,30 @@ backends arrancaron junto a la carga productiva sin impacto.
    uso lo pide.
 7. **Ampliar la gate de CC** a Turing/Ampere una vez validado en
    hardware (los kernels no contienen nada específico de SM70).
+
+## Quality gates A/B y tuning (2026-09-02, cierre del punto 5 y 3)
+
+GPU 1 dedicada (solo Qwen3-0.6B fp16 cargado, 32GB libres), offline
+LLM API, 20 prompts fijos + corpus de ~6k tokens.
+
+| Metrica | TRITON_PAGED | FLASH_ATTN_V100 | Delta |
+|---|---|---|---|
+| PPL media (corpus fijo) | 6.5771 | 6.5772 | 0.0001 |
+| Greedy match (20 prompts) | 19/20 | - | 1 divergencia tardia sinonima |
+| Logprob \|diff\| medio | 0.028 | - | ruido fp16 |
+| Decode b1 (tok/s) | 23.3 | 20.0 | **+16.4%** |
+| Decode b8 (tok/s) | 174.6 | 152.0 | **+14.9%** |
+| Decode b16 (tok/s) | 330.7 | 308.4 | **+7.2%** |
+| Prefill 2048 (ms) | 584.9 | 111.2 | 5.3x mas lento |
+
+**Veredicto de promocion**: criterio cumplido (PPL diff 1e-4 < 1e-2;
+decode no solo esta dentro del 10% sino que GANA en todos los batches).
+Debilited documentado: prefill largo 3x mas lento que FA incluso tras
+tuning (frontera Triton-vs-CUDA-hand-tuned en Volta).
+
+**Tuning aplicado** (f1-autotune.json, mediana de 20 corridas CUDA
+events): decode BLOCK_N 64->128 (-30% a 4k ctx); prefill BM 32->16
+(2.6x kernel; BM>=64 colapsa por spilling de los 64KB smem de Volta).
 
 ## Riesgos
 
