@@ -153,6 +153,11 @@ def _get_backend_priorities(
             ):
                 return [
                     AttentionBackendEnum.FLASH_ATTN_V100,
+                    # Self-contained Triton paged attention (sprint F1):
+                    # A/B candidate against FLASH_ATTN_V100. Only eligible
+                    # when explicitly selected or when the backends above
+                    # are invalid for the configuration.
+                    AttentionBackendEnum.TRITON_PAGED,
                     AttentionBackendEnum.TRITON_ATTN,
                     AttentionBackendEnum.FLEX_ATTENTION,
                     AttentionBackendEnum.TURBOQUANT,
