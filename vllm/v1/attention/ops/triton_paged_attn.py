@@ -40,6 +40,8 @@ def _store_kvcache_paged_kernel(
     k_cache_ptr,
     v_cache_ptr,
     slot_mapping_ptr,
+    k_block_stride,
+    v_block_stride,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
@@ -64,18 +66,20 @@ def _store_kvcache_paged_kernel(
     offs_d = tl.arange(0, head_dim)
     # Input: (num_tokens, num_kv_heads, head_dim), assumed contiguous.
     input_offset = token_idx * num_kv_heads * head_dim + head_idx * head_dim + offs_d
-    # Cache: (num_blocks, block_size, num_kv_heads, head_dim)
-    cache_offset = (
-        block_idx * block_size * num_kv_heads * head_dim
-        + block_offset * num_kv_heads * head_dim
+    k_offset = block_idx * k_block_stride + (
+        block_offset * num_kv_heads * head_dim
         + head_idx * head_dim
         + offs_d
     )
-
+    v_offset = block_idx * v_block_stride + (
+        block_offset * num_kv_heads * head_dim
+        + head_idx * head_dim
+        + offs_d
+    )
     key = tl.load(key_ptr + input_offset)
     value = tl.load(value_ptr + input_offset)
-    tl.store(k_cache_ptr + cache_offset, key)
-    tl.store(v_cache_ptr + cache_offset, value)
+    tl.store(k_cache_ptr + k_offset, key)
+    tl.store(v_cache_ptr + v_offset, value)
 
 
 def store_kvcache_paged(
@@ -115,6 +119,8 @@ def store_kvcache_paged(
         k_cache,
         v_cache,
         slot_mapping,
+        k_cache.stride(0),
+        v_cache.stride(0),
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         block_size=block_size,
@@ -131,6 +137,8 @@ def _paged_decode_attention_kernel(
     seq_lens_ptr,
     qo_offset_ptr,
     scale_log2,
+    k_block_stride,
+    v_block_stride,
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -191,14 +199,20 @@ def _paged_decode_attention_kernel(
         physical_block = tl.where(valid, physical_block, 0).to(tl.int64)
 
         # Cache: (num_blocks, block_size, num_kv_heads, head_dim)
-        kv_offset = (
-            physical_block[None, :] * (block_size * num_kv_heads * head_dim)
+        kv_offset_k = (
+            physical_block[None, :] * k_block_stride
+            + offs_in_block[None, :] * (num_kv_heads * head_dim)
+            + kv_head_idx * head_dim
+            + offs_d[:, None]
+        )
+        kv_offset_v = (
+            physical_block[None, :] * v_block_stride
             + offs_in_block[None, :] * (num_kv_heads * head_dim)
             + kv_head_idx * head_dim
             + offs_d[:, None]
         )
 
-        k = tl.load(k_cache_ptr + kv_offset, mask=valid[None, :], other=0.0)
+        k = tl.load(k_cache_ptr + kv_offset_k, mask=valid[None, :], other=0.0)
         k = k.to(tl.float32)
         score = tl.sum(q[:, None] * k, axis=0) * scale_log2
         qk = tl.where(valid, score, -float("inf"))
@@ -212,7 +226,7 @@ def _paged_decode_attention_kernel(
         acc = acc * alpha
         l_i = l_i * alpha
 
-        v = tl.load(v_cache_ptr + kv_offset, mask=valid[None, :], other=0.0)
+        v = tl.load(v_cache_ptr + kv_offset_v, mask=valid[None, :], other=0.0)
         v = v.to(tl.float32)
         weight = tl.where(valid, p, 0.0)
         acc = acc + tl.sum(weight[None, :] * v, axis=1)
@@ -271,6 +285,8 @@ def paged_decode_attention(
         seq_lens,
         query_start_loc,
         scale * _SM_SCALE_LOG2E_CONSTANT,
+        k_cache.stride(0),
+        v_cache.stride(0),
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
@@ -290,6 +306,8 @@ def _varlen_paged_prefill_attention_kernel(
     seq_lens_ptr,
     block_tables_ptr,
     scale_log2,
+    k_block_stride,
+    v_block_stride,
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -365,14 +383,14 @@ def _varlen_paged_prefill_attention_kernel(
         # Cache: (num_blocks, block_size, num_kv_heads, head_dim)
         # K^T tile: (head_dim, BLOCK_N)
         kv_offset_t = (
-            physical_block[None, :] * (block_size * num_kv_heads * head_dim)
+            physical_block[None, :] * k_block_stride
             + offs_in_block[None, :] * (num_kv_heads * head_dim)
             + kv_head_idx * head_dim
             + offs_d[:, None]
         )
         # V tile: (BLOCK_N, head_dim)
         kv_offset_n = (
-            physical_block[:, None] * (block_size * num_kv_heads * head_dim)
+            physical_block[:, None] * v_block_stride
             + offs_in_block[:, None] * (num_kv_heads * head_dim)
             + kv_head_idx * head_dim
             + offs_d[None, :]
@@ -466,6 +484,8 @@ def varlen_paged_prefill_attention(
         seq_lens,
         block_table,
         scale * _SM_SCALE_LOG2E_CONSTANT,
+        k_cache.stride(0),
+        v_cache.stride(0),
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
