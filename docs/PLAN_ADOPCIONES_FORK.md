@@ -72,27 +72,42 @@ si la estabilidad lo compensa.
 Punto 1 (INT4 KV en kernels TRITON_PAGED) pendiente; punto 4 (bench 262K)
 requiere ventana dedicada con carga decode-heavy cerca de capacidad.
 
-#### Blueprint F2.1 (INT4 KV per-token-head, sesion proxima)
+#### Blueprint F2.1 v2 (INT4 KV per-token-head, listo para implementar)
 
-1. Layout de cache: `[blocks, BS, KVH, D/2] uint8` (2x int4 empaquetados
-   por byte) + `[blocks, BS, KVH] float16` de escalas por (token, head).
-   El spec de cache se declara como FullAttentionSpec dtype uint8 con
-   head_size D/2 y las escalas viven en un tensor hermano — evitar
-   tocar el alocador del engine.
-2. Cuantizacion simetrica por (token,head): scale = max|k| / 7.0
-   (int4 simetrico con rango [-7,7]); cero exacto para slots -1.
-3. Store kernel: cuantiza+empaqua en `do_kv_cache_update` (extender
-   `store_kvcache_paged` con ruta int4 detras de un flag del Impl).
-4. Dequant en kernels de atencion: load u8 -> unpack (shift/mask) ->
-   `x * scale` broadcast antes del dot; sin cambios de grid.
-5. Gate: `kv_cache_dtype="int4"` aceptado solo en TRITON_PAGED con
-   D par; fail-closed en otros backends.
-6. Validacion: sonda standalone (patron F1: contiguo + unbind views) vs
-   referencia fp32; tolerancia objetivo max_diff < 0.05 fp16; luego
-   bateria PPL/greedy con Qwen3-0.6B y comparacion de capacidad KV
-   (el objetivo: 2x tokens de contexto vs fp16).
-7. Cuidado conocido: el zeroing del engine al liberar bloques debe
-   cubrir TAMBIEN el tensor de escalas (slots con escala 0 => dequant 0).
+INVESTIGACION COMPLETADA (2026-09-03): el fork ya tiene el patron
+completo en TRITON_ATTN (`int8_per_token_head`) — NO reinventar:
+
+1. **Estructura (espejo de triton_attn int8-PTH)**: cache de datos
+   int4-empaquetado con head-slot `D/2 + 4 uint8` (los 4 bytes del
+   final = escala fp32 por (block, slot, head), extraida con
+   `torch.as_strided` sobre el untyped storage — ver
+   `_ensure_scale_caches` de triton_attn.py:556). El spec presupuesta
+   la memoria de escalas en `AttentionSpec.page_size_bytes` cuando
+   `kv_quant_mode.is_per_token_head` (kv_cache_interface.py:166).
+2. **Modo nuevo**: `KVQuantMode.INT4_PER_TOKEN_HEAD` +
+   `get_kv_quant_mode("int4_per_token_head")` + branch en la capa
+   (`get_kv_cache_spec` de attention.py) construyendo el spec con
+   head_size empaquetado. CacheDType += "int4_per_token_head".
+3. **Store**: cuantizacion simetrica por (token,head),
+   `scale = max|k| / 7.0`, q en [-7,7], 2 nibbles por byte; hecho con
+   torch ops en el wrapper de `do_kv_cache_update` (el store kernel es
+   agnostico al dtype: head_dim = D/2+4 y tenentes uint8 pasan sin
+   cambios). Escalas escritas via las vistas as_strided.
+4. **Kernels**: `KV_INT4: tl.constexpr` en decode y prefill; load
+   bytes [.., D/2] -> unpack lo/hi -> `tl.interleave` -> fp32 ->
+   `* scale` broadcast (misma estructura del branch int8 de
+   triton_unified_attention.py:850). Offsets con head-slot D/2+4.
+5. **Gate**: "int4_per_token_head" solo en TRITON_PAGED (D par);
+   fail-closed en otros backends. Prefix caching no toca bytes.
+6. **Validacion**: sonda standalone (contiguo + unbind, patron F1) vs
+   referencia; luego bateria PPL/greedy con kv-cache-dtype int4 y
+   medicion de capacidad (objetivo ~3.5-3.9x tokens vs fp16).
+7. **Alternativa descartada**: consumir turboquant_4bit_nc (4-bit MSE
+   + norm correction en kernels TurboMind .so propietarios) — exige
+   reverse-engineering del layout de slots; int4 propio es mas simple
+   y basta para el objetivo de capacidad. int8_per_token_head (2x)
+   ya disponible hoy para TRITON_ATTN si se quiere compression sin
+   kernels nuevos.
 
 #### Wheel 1.5.0 adoptado (2026-09-03)
 
