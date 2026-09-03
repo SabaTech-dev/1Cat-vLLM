@@ -36,6 +36,22 @@ backend paged-attention Triton propio (port adaptado de MinivLLM/nano-vllm), sel
 4. Bench de rendimiento: t/s decode y TTFT ×1/×4; escribir configs ganadoras.
 5. Doc: `docs/backend-triton-paged-sm70.md` (cuándo usar cada backend).
 
+**ESTADO (2026-09-02): COMPLETADO Y PROMOVIDO.** Puntos 1-2 hechos (rama
+`sprint/f1-triton-attn`); el 3-4 se ejecutó sobre Qwen3-0.6B fp16 (ver
+limitación de modelo abajo) con GPU dedicada: PPL diff 1e-4 vs
+FLASH_ATTN_V100, decode GANA (+16% b1, +15% b8, +7% b16), greedy 19/20,
+tuning aplicado (decode BN=128, prefill BM=16; tiles grandes colapsan por
+smem en Volta). Debilidad documentada: prefill largo ~3x detrás de FA.
+CUDA Graphs: intentado y revertido (corrupción de primera petición;
+ver docs/f1-triton-paged-sm70.md).
+
+**LIMITACIÓN DE MODELO DESCUBIERTA**: el checkpoint HauhauCS Qwen3.8-27B
+disponible en formato HF es compressed-tensors W4A16, cuyo scheme exige
+capability >= 7.5 — NO carga en Volta (7.0); el BF16 local (~50 GB) no
+cabe en 32 GB. Los A/B sobre la familia de producción exigen re-cuantizar
+a GPTQ compatible SM70 o equivalentes; hasta entonces los gates se
+validan con modelos fp16 que quepan.
+
 **Riesgo**: Triton en SM70 es la capa portable pero poco optimizada; aceptar hasta −10% vs FA-lite
 si la estabilidad lo compensa.
 
@@ -125,5 +141,12 @@ unsloth-zoo, notebooks), investigación drivers/eco-sistema Volta.
   Sprint F1 (atención Triton autocontenida).
 
 ### Nota llama.cpp de producción (fuera de los dos repos, acción registrada)
-- Cherry-pick del pin #144 de unslothai/llama.cpp (MTP Qwen3.8-Flash-Next).
+- ~~Cherry-pick del pin #144 de unslothai/llama.cpp~~ OBSOLETO (2026-09-02):
+  upstream mergeó qwen4exp nativamente (#27742) y master ya trae draft-mtp
+  con auto-detección (#27005). Producción llama-second :8009 fue swap-eada
+  directamente a master 866322481 (56.7 tok/s temp-0, +26% vs FastMTP;
+  aceptación draft 0.90 vs 0.73). Detalle en Engram.
 - Fix de una línea: `GGML_CUDA_ENABLE_UNIFIED_MEMORY=0` (pin #149).
+- WIP perdido: `csrc/local_sm70_stubs.cpp` era untracked y se perdió en el
+  branch switch; solo sobrevive el hunk de CMakeLists en `stash@{0}`.
+  Regenerar los stubs desde los link-errors del build SM70 en F2.
