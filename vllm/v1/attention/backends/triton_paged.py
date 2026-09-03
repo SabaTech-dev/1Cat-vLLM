@@ -47,6 +47,23 @@ from vllm.v1.attention.ops.triton_paged_attn import (
     store_kvcache_paged,
     varlen_paged_prefill_attention,
 )
+
+
+def _quantize_int4_pth(x: torch.Tensor) -> torch.Tensor:
+    """Per-(token, head) symmetric int4 quantization for the paged cache.
+
+    x: (num_tokens, num_kv_heads, head_dim) fp16/fp32.
+    Returns uint8 (num_tokens, num_kv_heads, head_dim//2 + 4): two nibbles
+    per byte (low nibble = even lane) plus a trailing fp32 scale such that
+    data = round(x / scale) + 8 fits [0, 15].
+    """
+    hs = x.shape[-1]
+    amax = x.abs().amax(dim=-1, keepdim=True).float()
+    scale = (amax / 7.0).clamp_(min=1e-8).to(torch.float32)
+    q = torch.clamp(torch.round(x.float() / scale), -7, 7).to(torch.uint8) + 8
+    packed = q[..., 0::2] | (q[..., 1::2] << 4)
+    scale_bytes = scale.contiguous().view(torch.uint8)
+    return torch.cat([packed, scale_bytes], dim=-1)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 if TYPE_CHECKING:
@@ -160,9 +177,9 @@ class TritonPagedBackend(AttentionBackend):
         torch.float32,
     ]
     supported_kv_cache_dtypes: list[CacheDType] = [
-        # TODO(f1): fp8 KV cache (dequant in kernel), fp8 per-token-head.
         "auto",
         "float16",
+        "int4_per_token_head",
     ]
 
     # The KV cache update runs through do_kv_cache_update (the fork's
@@ -261,6 +278,7 @@ class TritonPagedImpl(AttentionImpl):
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.kv_cache_dtype = kv_cache_dtype
+        self.kv_int4 = kv_cache_dtype == "int4_per_token_head"
         self.attn_type = attn_type
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
@@ -342,6 +360,7 @@ class TritonPagedImpl(AttentionImpl):
                 head_dim=self.head_size,
                 block_size=kv_cache.shape[2],
                 scale=self.scale,
+                kv_int4=self.kv_int4,
             )
         else:
             # Prefill / extend (also used for multi-token decode steps,
@@ -362,6 +381,7 @@ class TritonPagedImpl(AttentionImpl):
                 block_size=kv_cache.shape[2],
                 max_query_len=attn_metadata.max_query_len,
                 scale=self.scale,
+                kv_int4=self.kv_int4,
             )
         return output
 
@@ -383,6 +403,13 @@ class TritonPagedImpl(AttentionImpl):
         if kv_cache.numel() == 0:
             return
         key_cache, value_cache = kv_cache.unbind(1)
+        if self.kv_int4:
+            # Packed uint8 slots: quantize to (head_dim//2 + 4)-byte rows;
+            # the store kernel handles the non-power-of-2 slot via its
+            # padded arange and skips slot == -1 natively (capture-safe).
+            key, value = (
+                _quantize_int4_pth(t) for t in (key, value)
+            )
         store_kvcache_paged(
             key=key,
             value=value,

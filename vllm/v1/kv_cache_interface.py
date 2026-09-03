@@ -41,6 +41,9 @@ class KVQuantMode(IntEnum):
     INT8_PER_TOKEN_HEAD = 2  # per-token-head dynamic scales for int8
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
     NVFP4 = 4  # packed fp4 data + fp8 block scales
+    INT4_PER_TOKEN_HEAD = 5  # packed int4 data + in-slot fp32 scale
+    # (TRITON_PAGED only: the fp32 scale lives in the last 4 bytes of the
+    # packed head slot, so the page budget needs no separate scale term)
 
     @property
     def is_per_token_head(self) -> bool:
@@ -64,6 +67,8 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.FP8_PER_TOKEN_HEAD
     if kv_cache_dtype == "nvfp4":
         return KVQuantMode.NVFP4
+    if kv_cache_dtype == "int4_per_token_head":
+        return KVQuantMode.INT4_PER_TOKEN_HEAD
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR
     return KVQuantMode.NONE
