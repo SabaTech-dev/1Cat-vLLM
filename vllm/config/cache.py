@@ -94,6 +94,10 @@ class CacheConfig:
     `ModelConfig` and that value should be manually duplicated here."""
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching."""
+    block_reuse_order: Literal["fifo", "lifo"] = "fifo"
+    """Free-block reuse order when prefix caching is disabled. "lifo"
+    re-allocates the most recently freed blocks first. Ignored (FIFO) when
+    prefix caching is enabled."""
     prefix_caching_hash_algo: PrefixCachingHashAlgo = "sha256"
     """Set the hash algorithm for prefix caching:
 
