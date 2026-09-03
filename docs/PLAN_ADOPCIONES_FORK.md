@@ -135,6 +135,29 @@ c) Integrar TurboQuant 4-bit (kernels .so de TurboMind ya validados
 
 Mientras tanto el dtype queda EXPERIMENTAL (default fp16 intacto).
 
+#### GATE E2E DEFINITIVO sobre el modelo de produccion (2026-09-03)
+
+QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 (el checkpoint recomendado de la
+release 1.5.0, 20 GB descargados) CARGA Y SIRVE en TRITON_PAGED TP1
+V100 con NVFP4 weights + kernels SM70 del wheel 1.5.0. Resultados del
+gate KV (dedicada, util 0.92, E5M2 no; fp16 vs int8-PTH):
+
+| Metrica | fp16 KV | int8-PTH KV |
+|---|---|---|
+| PPL (corpus) | 2.5404 | 2.7344 (+7.6%) |
+| Greedy coherente | 10/10 | 10/10 (0/10 byte-identico — ruido de cuantizacion) |
+| **Tokens de KV cache** | **42,780** | **63,488 (+48%)** |
+| Concurrencia max @4K | 10.44x | **15.50x** |
+
+VEREDICTO: int8-PTH es FUNCIONAL en el modelo de produccion — salidas
+coherentes, +48% de capacidad de contexto, coste PPL +7.6%. El +48%
+(menor que el 1.94x teorico del shrink de K/V) viene del estado GDN
+por-token no comprimible que acompana al KV en los hibridos Qwen3.8.
+El fallo del 1.7B (PPL +14%, salida rota) era sensibilidad de escala:
+los modelos menores degradan mas con KV int8. Queda experimental
+(opt-in) a la espera de calibracion de escalas (per-channel estaticas)
+para cerrar el gap de PPL.
+
 #### Wheel 1.5.0 adoptado (2026-09-03)
 
 El venv de desarrollo (/srv/benchmarks/1cat/venv) migra del wheel 1.3.0
