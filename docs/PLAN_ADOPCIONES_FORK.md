@@ -63,10 +63,14 @@ si la estabilidad lo compensa.
 
 ## Sprint F2 — KV cache: INT4 + higiene de bloques
 
-**ESTADO (2026-09-03)**: punto 3 HECHO — LIFO free-block reuse portado
-(`--block-reuse-order lifo` en CacheConfig; activo solo con prefix caching
-off; unit test verifica reuso de los recién liberados). Commit 252d6b6b4.
-Punto 1 (INT4 KV en kernels TRITON_PAGED) y punto 2 (watermark) pendientes.
+**ESTADO (2026-09-03)**: puntos 2 y 3 HECHOS —
+- Punto 2 (watermark): port de upstream vllm#44594 (mergeado jun-2026);
+  `--watermark <fracción>` reserva bloques libres en admisiones de
+  waiting/preempted (default 0.0 = off). Commit b1848928f. Smoke E2E OK.
+- Punto 3 (LIFO): `--block-reuse-order lifo` (solo con prefix caching
+  off; unit test de reuso). Commit 252d6b6b4.
+Punto 1 (INT4 KV en kernels TRITON_PAGED) pendiente; punto 4 (bench 262K)
+requiere ventana dedicada con carga decode-heavy cerca de capacidad.
 
 **RETRACCIÓN (2026-09-03)**: el "bug de engine a util baja" de esta
 misma noche era un FALSO POSITIVO — no existe. Qwen3-0.6B es un modelo
