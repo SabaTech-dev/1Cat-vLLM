@@ -365,6 +365,40 @@ Configuracion de produccion recomendada para este checkpoint:
 TURBOMIND=1 + KV fp16. El int8-PTH requiere calibracion (per-channel)
 antes de usarse en modelos sensibles.
 
+#### F2.4 (2026-09-03): calibracion int8 entregada + matriz de dtypes F2
+
+Calibracion de escalas: el fallo int8-PTH en HauhauCS NO era NaN/Inf
+(diagnostico: 0 filas afectadas) sino outliers intra-fila: amax p50=
+0.0, p99=8.79, max=89.7 por (token,head) -> la escala amax/127 deja
+~1% de resolucion a los canales de la masa. Fix: clip de percentil
+(k-th mayor con suelo 5% de amax), env VLLM_SM70_INT8_CLIP, default
+1% (commit 7bbb3ac94). Resultados (PPL, fp16 como referencia):
+- HauhauCS 27B AWQ: 215.2 (amax) -> 4.21 (clip 1%), fp16 3.04 (+38%)
+  [sweep: 0.2%->4.36, 1%->4.21, 5%->4.46; optimo ~1%]
+- QUASAR 27B NVFP4: 2.73 (amax) -> 2.71 (clip 1%), fp16 2.54 (+6.7%,
+  mejora vs +7.6% del amax). El clip es ganancia estricta en ambos.
+
+Matriz de dtypes KV (F2 cerrada):
+| dtype | QUASAR NVFP4 | HAUHAUCS AWQ |
+| fp16 | PPL 2.54, ctx 42780 | PPL 3.04 |
+| int8+clip1% | PPL 2.71 (+6.7%), ctx 63488 (+48%) | PPL 4.21 (+38%) |
+| int4 sim | fail (outliers post-RoPE) | fail |
+| int8k_int4v | fail-closed (slot uniforme) | fail-closed |
+
+Graphs + AWQ TurboMind: la memoria cabe (batched-tokens 1024,
+max-seqs 16, util 0.92) PERO la salida se corrompe (PPL 1.6M vs eager
+3.04): el GEMM TurboMind usa workspace cacheado por stream
+(StreamWorkspaceKey en el binario) y no es graph-safe. AWQ = eager
+obligatorio hasta que el kernel se haga graph-safe (candidato a report
+upstream). Graphs solo para el camino NVFP4.
+
+Hallazgo de escalado (pendiente dedicar sesion): el prefill varlen de
+TRITON_PAGED no completa en tiempo razonable a partir de ~16K tokens
+de contexto en TP1 eager (6.1K verificado OK; 16K/32K/55K > 20-25 min
+sin progreso observable). La capacidad de KV (63K int8) queda asi
+inaccesible en un solo contexto hasta diagnosticar el kernel/scheduler.
+La metodologia #474 (262K) requiere este fix previo.
+
 Hallazgos transferibles documentados en #441/humanjesse:
 - Spec-decode en V100 es net-negativo hoy (flash_attn_v100 no sostiene
   graphs bajo spec → PIECEWISE ~46 tok/s; triton_attn ~77 vs ~100
