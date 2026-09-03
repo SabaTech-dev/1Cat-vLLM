@@ -219,6 +219,57 @@ de latencia TP2, sin dependencia de SM.
 3. Tag de release estable del fork; rama de mantenimiento por línea menor upstream (pinning).
 4. Anuncio en vllm-project/vllm#47019 (comunidad V100 activa) sin datos propietarios.
 
+## Estado consolidado y riesgo de perdida (auditoria 2026-09-03)
+
+### Inventario de piezas propias (rama sprint/f1-triton-attn sobre main)
+
+| Pieza | Estado | Commits |
+|---|---|---|
+| TRITON_PAGED backend (kernels + registry) | VALIDADO (paridad + perf) | 242ed13f7, c91f09f71 |
+| Tuning tiles (decode BN=128, prefill BM=16) | VALIDADO | a1ba06381 |
+| CUDA Graphs decode-only | VALIDADO (3.4-4.2x decode) | 0c21c34b2 |
+| LIFO free-block reuse | VALIDADO unit | 1f1c3828d |
+| Watermark (port #44594) | VALIDADO smoke | db99c79e3 |
+| int8-PTH KV | EXPERIMENTAL funcional (+48% ctx en QUASAR 27B; PPL +7.6%) | dee9d7060 |
+| int8k/int4v + int4 simetrico | EXPERIMENTAL fail-closed (outliers RoPE) | 17db6425e |
+| get_kv_cache_shape pad PTH | VALIDADO | dee9d7060 |
+| QSA pre-Ampere | SUPERSEDED por #469 (eliminado) | — |
+
+### Riesgos de perdida detectados y accion
+
+1. **Tooling de validacion en /tmp (VOLATIL)** — RESUELTO: bateria,
+   corpus, sondas y gate QUASAR versionados en
+   `tools/sm70_validation/` con sus lecciones operativas.
+2. **Hueco probe/E2E sin aislar** (int8-PTH: sonda pasa, E2E PPL
+   +0.66 en 1.7B pero solo +7.6% aceptable en QUASAR 27B) — el
+   aislamiento (prefix-reuse + multi-chunk + slots dispersos en la
+   sonda) queda como primer item de F2.4.
+3. **Syncs futuros**: upstream main avanza rapido (PLE, E4M3 QSA KV,
+   MTP5). Cada sync debe preservar los 15 commits propios — rebase con
+   conflicto esperado solo en arg_utils.py (flags propias).
+4. **stash@{0}** obsoleto (stubs perdidos + CMakeLists; el build SM70
+   lo cerro upstream #420) — dropear sin remordimiento.
+5. **Resultados de gates solo en JSON de /tmp** — los numeros clave
+   estan en este documento y en Engram; los JSON crudos se regeneran
+   con el tooling versionado.
+
+### Conflictos y sinergias entre sprints (nuevo)
+
+- **F4 (spec decode) vs hallazgo humanjesse**: spec-decode es
+  net-negativo en V100 hoy (flash_attn_v100 sin graphs bajo spec ->
+  46 tok/s; triton_attn 77 vs 100 sin spec). F4 debe RE-ENFOCARSE:
+  la via prometedora es comprobar si TRITON_PAGED sostiene graphs
+  decode-only bajo verify multi-token (nuestro path prefill cubre
+  multi-token) antes de invertir en EAGLE3.
+- **F8 toolchain vs triton 3.5.1**: humanjesse documenta decode MLA
+  ~3x mas lento con triton 3.6.0 en V100. Benchmarkear TRITON_PAGED
+  bajo 3.5.1; si gana, pinear.
+- **F9 vs upstream #464-473** (AWQ Qwen3.8 SM70, en revision): si
+  aterrizan, parte del port F9 (kernels W4A16) puede venir de
+  upstream; el hibrido y GGUF seguirian siendo nuestros.
+- **F2.4 (bench 262K)**: usar la metodologia de #474 (concurrencia
+  no-MTP TP4 con kernels por evidencia) adaptada a TP1.
+
 ## Orden y dependencias
 
 ```
