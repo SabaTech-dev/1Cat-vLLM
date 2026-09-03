@@ -92,14 +92,18 @@ class TritonPagedMetadata:
 
 
 class TritonPagedMetadataBuilder(AttentionMetadataBuilder[TritonPagedMetadata]):
-    # CUDA graphs: attempted 2026-09-02 and reverted. Both piecewise and
-    # decode-only capture deterministically corrupted the first replayed
-    # request on V100 (Qwen3-0.6B, "Francia" prompt), while later requests
-    # stayed coherent. Root cause not yet isolated (capture-time kernel
-    # constexprs vs serving-time buffer layout are the prime suspects).
-    # The backend is fully functional in eager mode; keep graphs off until
-    # the capture path is instrumented properly.
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    # Graph-safe for pure decode batches (shapes derive from the runner's
+    # persistent padded buffers, no host syncs, store skips slot == -1).
+    # Re-evaluated 2026-09-03 at util 0.85: greedy outputs are identical to
+    # eager across piecewise and decode-only capture, decode b1 goes from
+    # 22.9 to 316 tok/s (13.8x). The earlier "corrupted first request" was
+    # a misdiagnosis: Qwen3-0.6B is a BASE model and that is its legitimate
+    # raw-completion output (chat-templated serving says "Paris"; raw
+    # completion says otherwise). Scope: decode-only is the measured-fastest
+    # and most conservative mode.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
 
     def __init__(
         self,

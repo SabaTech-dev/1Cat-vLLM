@@ -126,7 +126,7 @@ backends arrancaron junto a la carga productiva sin impacto.
 ## Qué queda (orden propuesto)
 
 1. ~~**Prueba funcional end-to-end en V100**~~ (HECHA 2026-09-02: paridad greedy byte-identica vs FLASH_ATTN_V100 tras el fix de strides a327d45b7).
-2. ~~**CUDA Graphs**~~ (INTENTADO y REVERTIDO 2026-09-02: corrompia la primera peticion en piecewise y decode-only; causa raiz no aislada. Ver seccion arriba.)
+2. ~~**CUDA Graphs**~~ (RESTABLECIDOS 202-09-03: decode-only, greedy 20/20 identico a eager, decode 3.4-4.2x mas rapido. La "corrupcion" original era un falso positivo de canario — ver seccion.)
 3. ~~**Autotuning**~~ (HECHO 2026-09-02: decode BN=128, prefill BM=16/BN=64; datos en f1-autotune.json). Queda opcional: partir el bucle KV en el bloque diagonal.
 4. **Rendimiento decode**: el kernel decode es 1 fila por programa; si
    el batch pequeño deja la GPU ociosa, evaluar split-K (varios
@@ -165,18 +165,26 @@ tuning (frontera Triton-vs-CUDA-hand-tuned en Volta).
 events): decode BLOCK_N 64->128 (-30% a 4k ctx); prefill BM 32->16
 (2.6x kernel; BM>=64 colapsa por spilling de los 64KB smem de Volta).
 
-## CUDA Graphs: intento y reversion (2026-09-02)
+## CUDA Graphs: RESTABLECIDOS (2026-09-03, re-evaluacion)
 
-Se implemento soporte (`AttentionCGSupport.ALWAYS` +
-`build_for_cudagraph_capture` al estilo triton_attn). Resultado:
-corrupcion determinista de la PRIMERA peticion reproducida en un
-graph ("La capital de Francia" -> salida sin sentido) con captura
-piecewise y tambien con decode-only (`UNIFORM_SINGLE_TOKEN_DECODE`);
-las peticiones posteriores eran coherentes. Causa raiz no aislada
-(sospechosos: constexprs de kernel fijados en captura vs layout de
-los buffers persistentes en serving). REVERTIDO a NEVER: el backend
-es plenamente funcional en eager; graphs queda como limitacion
-documentada hasta instrumentar el path de captura.
+Historia de la correccion: el intento del 2026-09-02 se reverso por una
+"corrupcion de la primera peticion" que resulto ser un FALSO POSITIVO —
+Qwen3-0.6B es un modelo BASE y "el **Estados Unidos**..." es su
+continuacion raw legitima de "La capital de Francia es" (el "Paris"
+esperado venia del path con CHAT TEMPLATE del test de server E2E).
+Verificacion final a util 0.85 dedicada:
+
+- Greedy 20/20 IDENTICO graphs-vs-eager (bateria completa)
+- PPL identica (6.5758 ambos)
+- Decode: 4.2x (b1: 310 vs 73 tok/s), 3.8x (b8: 1946), 3.4x (b16: 3309)
+- Prefill sin cambio (249 vs 250 ms; decode-only capture)
+- piecewise y decode-only ambos correctos; se restaura como
+  `UNIFORM_SINGLE_TOKEN_DECODE` (el mas conservador, rendimiento igual)
+
+Leccion registrada: el canario de corrupcion debe corresponder al API
+path del test (raw completion vs chat template); juzgar completions raw
+de un modelo base contra expectativas con template produce falsos
+positivos deterministas.
 
 ## Modelo de produccion en vLLM/Volta: infeasible (2026-09-02)
 
