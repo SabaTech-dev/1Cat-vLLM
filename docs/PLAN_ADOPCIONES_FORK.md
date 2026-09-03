@@ -399,6 +399,28 @@ sin progreso observable). La capacidad de KV (63K int8) queda asi
 inaccesible en un solo contexto hasta diagnosticar el kernel/scheduler.
 La metodologia #474 (262K) requiere este fix previo.
 
+#### Diagnostico del stall (2026-09-03, sesion issues)
+
+Patron confirmado: GPU 100% con progreso CERO -> kernel colgado, no
+scheduler. Faulthandler (in-process, 32K ctx): el stack del engine
+cayo dentro de la cadena de muestreo greedy fundida
+(qwen3_5.get_top_tokens -> logits_processor:319 ->
+lm_head.maybe_get_sm70_lm_head_top1 -> op sm70_f16_lm_head_top1_out
+sin retornar). Con VLLM_SM70_LM_HEAD_TOP1=0 el stall persiste (GPU
+100%, 0%), pero esa corrida quedo en modo subprocess y el stack del
+engine no se capturo -> inconcluso. Siguiente sesion: py-spy al
+EngineCore con sudo (el dump al padre solo muestra queue.get),
+probar tambien TOP1_TC=0 y capturar el segundo dump. Sospechoso
+principal: familia de ops fundidas del LM head a contexto largo.
+Nota operacional: llama-second se auto-restaura (watchdog) y compite
+por GPU 1 - verificar memory.used=0 ANTES de cada ventana; los logs
+deben ir a /tmp/opencode (/srv/benchmarks no es escribible por joker).
+Issues revisadas: #478 (DFlash2 acceptance=0 TP4, spec-decode roto en
+SM70 - confirma re-scope de F4), #424 (MTP crash a contexto
+extendido), #214 (fused layernorm false-positive MTP). #334 respondida
+con nuestra receta validada (env TURBOMIND + eager + memory tuning +
+clip).
+
 Hallazgos transferibles documentados en #441/humanjesse:
 - Spec-decode en V100 es net-negativo hoy (flash_attn_v100 no sostiene
   graphs bajo spec → PIECEWISE ~46 tok/s; triton_attn ~77 vs ~100
