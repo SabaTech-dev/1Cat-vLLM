@@ -57,6 +57,20 @@ si la estabilidad lo compensa.
 
 ## Sprint F2 — KV cache: INT4 + higiene de bloques
 
+**ESTADO (2026-09-03)**: punto 3 HECHO — LIFO free-block reuse portado
+(`--block-reuse-order lifo` en CacheConfig; activo solo con prefix caching
+off; unit test verifica reuso de los recién liberados). Commit 252d6b6b4.
+Punto 1 (INT4 KV en kernels TRITON_PAGED) y punto 2 (watermark) pendientes.
+
+**BUG DE ENGINE DESCUBIERTO (reportable upstream)**: con
+`gpu_memory_utilization` bajo (<= ~0.3 con Qwen3-0.6B fp16), la PRIMERA
+petición produce salida corrupta — independiente del backend de atención
+(reproducido en TRITON_PAGED y FLASH_ATTN_V100), de eager/graphs, de
+prefix caching on/off y de fifo/lifo. A util 0.85 (baterías F1) la salida
+es limpia. Sospecha: en pools de KV mínimos, la reserva del scheduler
+(`scheduler_reserve_full_isl`) deja bloques insuficientes para el ISL
+completo y el path de admisión corrompe el estado.
+
 **Objetivo**: duplicar contexto utilizable y reducir preemption.
 
 1. Port del INT4 per-token-head KV-quant Triton (vLLM #40835) junto al fp8_e5m2 existente.
