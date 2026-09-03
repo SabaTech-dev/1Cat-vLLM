@@ -26,6 +26,9 @@ References:
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
+import functools
+import os
+
 import torch
 
 from vllm.config import VllmConfig
@@ -50,17 +53,59 @@ from vllm.v1.attention.ops.triton_paged_attn import (
 )
 
 
-def _quantize_int8_pth(x: torch.Tensor) -> torch.Tensor:
+@functools.lru_cache(maxsize=1)
+def _int8_clip_frac() -> float:
+    """Fraction of channels per row allowed to saturate in int8 K/V
+    quantization (env VLLM_SM70_INT8_CLIP, default 0.01; 0 disables
+    clipping and restores the pure amax scale)."""
+    raw = os.getenv("VLLM_SM70_INT8_CLIP")
+    if raw is None:
+        return 0.01
+    try:
+        return max(0.0, min(float(raw), 0.5))
+    except ValueError:
+        return 0.01
+
+
+def _row_clip_threshold(xf: torch.Tensor, clip_frac: float) -> torch.Tensor:
+    """Per-row magnitude threshold allowing the top clip_frac channels to
+    saturate. Returns a (…, 1) tensor broadcastable over the last dim.
+    clip_frac <= 0 falls back to the row amax (no clipping).
+    """
+    amax = xf.abs().amax(dim=-1, keepdim=True)
+    if clip_frac <= 0:
+        return amax
+    d = xf.shape[-1]
+    k = max(2, int(d * clip_frac))
+    # (k+1)-th largest magnitude becomes the scale reference; the k
+    # largest channels saturate at +-127.
+    kth = torch.topk(xf.abs(), k + 1, dim=-1).values[..., -1:].float()
+    # Never let clipping shrink the scale below 5% of amax: protects rows
+    # whose mass is a single dominant channel.
+    return torch.maximum(kth, amax * 0.05)
+
+
+def _quantize_int8_pth(x: torch.Tensor, clip_frac: float | None = None) -> torch.Tensor:
     """Per-(token, head) symmetric int8 quantization (K side).
 
     x: (num_tokens, num_kv_heads, head_dim) -> int8
     (num_tokens, num_kv_heads, head_dim + 4): full-resolution bytes plus a
     trailing fp32 scale. The int8 range (127) tolerates the post-RoPE
     key outliers that break symmetric int4.
+
+    clip_frac (env VLLM_SM70_INT8_CLIP, default 0.01) lets the largest
+    channels of each row saturate instead of stretching the scale to the
+    row amax. Fine-tuned checkpoints can carry single-channel outliers
+    100x the row median; an amax scale then leaves ~1% resolution for the
+    mass channels and collapses perplexity.
     """
-    amax = x.abs().amax(dim=-1, keepdim=True).float()
-    scale = (amax / 127.0).clamp_(min=1e-8).to(torch.float32)
-    q = torch.clamp(torch.round(x.float() / scale), -127, 127).to(torch.int8)
+    if clip_frac is None:
+        clip_frac = _int8_clip_frac()
+    xf = x.float()
+    scale = (
+        (_row_clip_threshold(xf, clip_frac) / 127.0).clamp_(min=1e-8).to(torch.float32)
+    )
+    q = torch.clamp(torch.round(xf / scale), -127, 127).to(torch.int8)
     scale_bytes = scale.contiguous().view(torch.uint8)
     return torch.cat([q.view(torch.uint8), scale_bytes], dim=-1)
 
@@ -80,6 +125,8 @@ def _quantize_int4_pth(x: torch.Tensor) -> torch.Tensor:
     packed = q[..., 0::2] | (q[..., 1::2] << 4)
     scale_bytes = scale.contiguous().view(torch.uint8)
     return torch.cat([packed, scale_bytes], dim=-1)
+
+
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 if TYPE_CHECKING:
