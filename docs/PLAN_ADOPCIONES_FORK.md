@@ -42,8 +42,14 @@ limitación de modelo abajo) con GPU dedicada: PPL diff 1e-4 vs
 FLASH_ATTN_V100, decode GANA (+16% b1, +15% b8, +7% b16), greedy 19/20,
 tuning aplicado (decode BN=128, prefill BM=16; tiles grandes colapsan por
 smem en Volta). Debilidad documentada: prefill largo ~3x detrás de FA.
-CUDA Graphs: intentado y revertido (corrupción de primera petición;
-ver docs/f1-triton-paged-sm70.md).
+
+**ACTUALIZACIÓN (2026-09-03)**: CUDA Graphs RESTABLECIDOS tras
+re-evaluación (el revert del 09-02 fue un falso positivo de canario —
+modelo base vs chat template, ver docs/f1-triton-paged-sm70.md):
+greedy 20/20 idéntico a eager, PPL idéntica, decode 3.4-4.2× más rápido
+(b1: 310 vs 73 tok/s; b16: 3309 vs 966). Soporte final:
+`UNIFORM_SINGLE_TOKEN_DECODE`. El backend queda con paridad numérica
+completa Y la mejor velocidad de decode medida en V100.
 
 **LIMITACIÓN DE MODELO DESCUBIERTA**: el checkpoint HauhauCS Qwen3.8-27B
 disponible en formato HF es compressed-tensors W4A16, cuyo scheme exige
