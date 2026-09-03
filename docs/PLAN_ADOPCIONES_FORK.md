@@ -72,6 +72,42 @@ si la estabilidad lo compensa.
 Punto 1 (INT4 KV en kernels TRITON_PAGED) pendiente; punto 4 (bench 262K)
 requiere ventana dedicada con carga decode-heavy cerca de capacidad.
 
+#### Blueprint F2.1 (INT4 KV per-token-head, sesion proxima)
+
+1. Layout de cache: `[blocks, BS, KVH, D/2] uint8` (2x int4 empaquetados
+   por byte) + `[blocks, BS, KVH] float16` de escalas por (token, head).
+   El spec de cache se declara como FullAttentionSpec dtype uint8 con
+   head_size D/2 y las escalas viven en un tensor hermano — evitar
+   tocar el alocador del engine.
+2. Cuantizacion simetrica por (token,head): scale = max|k| / 7.0
+   (int4 simetrico con rango [-7,7]); cero exacto para slots -1.
+3. Store kernel: cuantiza+empaqua en `do_kv_cache_update` (extender
+   `store_kvcache_paged` con ruta int4 detras de un flag del Impl).
+4. Dequant en kernels de atencion: load u8 -> unpack (shift/mask) ->
+   `x * scale` broadcast antes del dot; sin cambios de grid.
+5. Gate: `kv_cache_dtype="int4"` aceptado solo en TRITON_PAGED con
+   D par; fail-closed en otros backends.
+6. Validacion: sonda standalone (patron F1: contiguo + unbind views) vs
+   referencia fp32; tolerancia objetivo max_diff < 0.05 fp16; luego
+   bateria PPL/greedy con Qwen3-0.6B y comparacion de capacidad KV
+   (el objetivo: 2x tokens de contexto vs fp16).
+7. Cuidado conocido: el zeroing del engine al liberar bloques debe
+   cubrir TAMBIEN el tensor de escalas (slots con escala 0 => dequant 0).
+
+#### Wheel 1.5.0 adoptado (2026-09-03)
+
+El venv de desarrollo (/srv/benchmarks/1cat/venv) migra del wheel 1.3.0
+al 1.5.0 oficial (`1cat_vllm-1.5.0-cp312`): resuelve el hibrido de
+imports, alinea los kernels compilados (FlashAttention-V100, TurboMind
+sampler, FlashQLA GDN sm70) y trae las mejoras XQA de la release. Los
+.so del arbol del fork se refrescaron desde el wheel. Verificacion:
+greedy 20/20 identico, PPL 6.5758, b8 +8.5% (2192 tok/s), b16 +4.3%,
+prefill igual. Respaldo del estado 1.3.0:
+`/tmp/opencode/venv-vllm-130-backup.tar.gz` (78 MB). El bug #457
+(loop) es especifico del checkpoint QUASAR NVFP4 — no afecta nuestro
+uso (modelos fp16 de desarrollo; el Qwen3.8-27B de produccion vive en
+llama.cpp).
+
 **RETRACCIÓN (2026-09-03)**: el "bug de engine a util baja" de esta
 misma noche era un FALSO POSITIVO — no existe. Qwen3-0.6B es un modelo
 BASE y su completion raw de "La capital de Francia es" es "el
