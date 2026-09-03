@@ -109,6 +109,32 @@ completo en TRITON_ATTN (`int8_per_token_head`) — NO reinventar:
    ya disponible hoy para TRITON_ATTN si se quiere compression sin
    kernels nuevos.
 
+#### RESULTADO F2.1 (2026-09-03): implementado, gate de calidad FALLA
+
+La implementacion completa esta en `93f591250` (store cuantizado con
+torch ops, store kernel con arange almohillado para slots de 68 bytes,
+decode/prefill con unpack + descale, escalas in-slot, spec/allocation
+uint8 sin tocar el alocador). La sonda standalone PASA (prefill 3e-4,
+decode 2.5e-2 vs dequant). PERO el gate E2E en Qwen3-0.6B FALLA:
+salida garbage con --kv-cache-dtype int4_per_token_head.
+
+**Causa raiz (analisis)**: K post-RoPE tiene dimensiones outlier
+(amax >> typical) — la escala simetrica por (token,head) amax/7 deja
+SNR ~1 en las dimensiones no-outlier => la atencion se degrada a
+ruido. La sonda sintetica (randn sin outliers) no puede detectarlo.
+Es LA limitacion conocida del int4 simetrico por token-head.
+
+**Caminos para promover (ordenado por esfuerzo)**:
+a) Hibrido int8-K + int4-V: K sin outliers severos post-RoPE en int8
+   (2x), V con distribucion mas pareja en int4 (~3.5x) => ~2.7x
+   capacidad combinada; solo cambia el packing del store.
+b) Escalas por-canal estaticas (calibradas) para las dims outlier +
+   escala dinamica por token-head: mas storage de escalas.
+c) Integrar TurboQuant 4-bit (kernels .so de TurboMind ya validados
+   en FA-V100) — requiere consumir su formato desde Triton.
+
+Mientras tanto el dtype queda EXPERIMENTAL (default fp16 intacto).
+
 #### Wheel 1.5.0 adoptado (2026-09-03)
 
 El venv de desarrollo (/srv/benchmarks/1cat/venv) migra del wheel 1.3.0
