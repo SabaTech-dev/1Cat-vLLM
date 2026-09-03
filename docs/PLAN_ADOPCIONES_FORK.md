@@ -237,6 +237,10 @@ Peuqui reporta tuning medido en producción (2×RTX 8000 + 3×V100,
 Qwen3.8 bajo llama-swap). Estado de adopción:
 
 1. **QSA dispatch pre-Ampere — ADOPTADO, CORREGIDO (2026-09-03)**:
+   ALCANCE: QSA solo existe en la familia **Qwen3.8-Flash-Next**
+   (qwen4_exp, MoE A4B de 48 capas 36 GDN + 12 QSA) — el 27B denso
+   (QUASAR) NO tiene capas QSA y no se beneficia de este tuning. Las
+   mediciones de #441 son sobre Flash-Next-180B en producción.
    CORRECCIÓN de ruta: el archivo vivo en CUDA es
    `qwen4_exp/nvidia/ops/qsa.py` (el árbol `amd/` es la vía ROCm — la
    nota original de #441 estaba invertida; el primer parche tocó el
@@ -262,6 +266,40 @@ Qwen3.8 bajo llama-swap). Estado de adopción:
    (flash-attention #190). Referencia para F4.
 4. **TP heterogéneo sm70/sm75**: derivar la versión de FA por worker en
    vez de por device 0 (vllm #54758). Referencia para despliegues mixtos.
+
+### Sprint F9 — Modelos de producción en vLLM vía humanjesse/vllm-v100
+
+DESCUBRIMIENTO (2026-09-03): humanjesse/vllm-v100 (fork de 1Cat ~0.0.3,
+sin ancestro común con main actual, 23★) tiene AWQ-INT4 W4A16 FUNCIONAL
+en V100 con flota verificada: Qwen3.6-27B-AWQ-INT4 (híbrido GDN — misma
+familia arch que nuestro HauhauCS AWQ), MiniMax-M2.7-240B MoE, granite
+8B, DeepSeek-V4-Flash W4A16, y GGUF servidos nativamente (Qwen3.6-35B
+Q8 en 2×V100 ~100 tok/s con fixes RMSNorm/A_log/permute, Qwen3.5-122B
+Q6_K en 8×V100, MiMo-310B, Mistral4-119B).
+
+Piezas a portar (por tamaño):
+1. `turbomind_asym.py` (213 líneas, archivo nuevo) —
+   TurboMindAsymLinearKernel para W4A16 asimétrico vía `awq_gemm_sm70`
+   (<0.1% error vs 2% del kernel Triton GPTQ que compone a garbage).
+   Desbloquea la carga de HauhauCS AWQ-MTP (nuestro checkpoint de
+   producción, W4A16 asimétrico).
+2. Wiring compressed-tensors→AWQ SM70: delegación de
+   CompressedTensorsSM70WNA16MoEMethod a AWQSM70MoEMethod + manejo de
+   ignore-list y tuple-shard en el loader de qwen3_5.
+3. GGUF classes qwen3_5_moe con los fixes críticos: RMSNorm Gemma-style
+   `+1` (llama.cpp lo hornea en los pesos), `A_log` ya-exponentiado,
+   permute de value-heads GDN, replicación KV para TP > nkv.
+4. Regression runner de su flota verificado como harness.
+
+Hallazgos transferibles documentados en #441/humanjesse:
+- Spec-decode en V100 es net-negativo hoy (flash_attn_v100 no sostiene
+  graphs bajo spec → PIECEWISE ~46 tok/s; triton_attn ~77 vs ~100
+  sin spec) — impacta el diseño de F4.
+- triton 3.6.0 genera código de decode MLA ~3× más lento en V100 que
+  3.5.1 (ellos pinean 3.5.1) — benchmarkear nuestro TRITON_PAGED bajo
+  3.5.1 antes de descartar.
+- flash_attn_v100 dense prefill tenía un bug de aliasing sP/sS que
+  ellos fixearon (be0fe44b) — verificar si nuestro vendor lo hereda.
 
 ## Fuera de alcance
 
