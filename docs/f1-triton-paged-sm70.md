@@ -196,6 +196,27 @@ V100 requiere una cuantizacion compatible con SM70 (GPTQ con kernel
 viejo o similar) o permanecer en llama.cpp. Los gates A/B y tuning
 de F1 se validaron con Qwen3-0.6B fp16 (dedicada).
 
+## Rebase sobre v1.5.0 (2026-09-03)
+
+`sprint/f1-triton-attn` rebasada de `v1.3.0-380` (fa344edba) a la tag
+`v1.5.0` (d8f42b39): 11/11 commits re-aplicados SIN conflictos (el unico
+archivo compartido con la release, arg_utils.py, se auto-resolvio).
+Verificacion a util 0.85 dedicada (misma bateria, Qwen3-0.6B fp16):
+
+- Graphs (via promovida): greedy 20/20 IDENTICO pre-vs-post, PPL
+  6.5758 ambas, decode b1 311.0 vs 310.4, b8 2021 vs 1946, b16 3336 vs
+  3309, prefill 248 vs 249 ms -> paridad completa, b8 +3.9%.
+- Eager: greedy 18/20 (2 divergencias por los cambios funcionales de la
+  release; PPL 6.5748 vs 6.5758).throughput eager aparentaba -3x pero el
+  CONTROL con codigo pre-rebase en la misma hora mide igual (23.1 vs
+  22.9 b1): el descenso es AMBIENTAL del host, no del rebase. La via
+  graphs es inmune (replay).
+
+El fork queda alineado con la release v1.5.0 (DFlash2 produccion,
+QUASAR NVFP4, Flash-V100 long-context) sin perder ninguna de nuestras
+piezas: TRITON_PAGED, graphs decode-only, LIFO, watermark, QSA
+pre-Ampere.
+
 ## Riesgos
 
 - **Sin CUDA Graphs el decode pierde throughput** frente a FA-V100 en
