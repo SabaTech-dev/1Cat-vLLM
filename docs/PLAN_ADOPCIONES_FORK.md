@@ -246,8 +246,11 @@ Qwen3.8 bajo llama-swap). Estado de adopción:
    según base_programs). Datos finales de Peuqui: narrow-16 gana TODOS
    los regímenes de prefill en V100 (1.2-2.6×) y RTX 8000 (1.16-1.20×)
    con numérica idéntica; el tile de 64 columnas ni siquiera lanza en
-   SM75 a D=256 (OutOfResources vs 64 KiB smem). Su PR upstream está en
-   camino — cuando aterrice, evaluar soltar nuestro parche local.
+   SM75 a D=256 (OutOfResources vs 64 KiB smem). **SUPERSEDED**: su PR
+   upstream #469 aterrizó y fue mergeado (2026-09-03 11:15) — el fork
+   se sincronizó con origin/main (45a58ab67), nuestro parche local se
+   eliminó y el dispatch #469 quedó validado 8/8 con los casos de test
+   del propio PR.
 2. **flash_attn_v100 prefill tile 64×80 (−13 % en D=128) — PENDIENTE**:
    el tile 32×176 está horneado en el wheel compilado
    `flash_attn_v100`; hace falta la fuente del paquete (Peuqui ofrece
