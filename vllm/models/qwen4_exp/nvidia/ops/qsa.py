@@ -2119,18 +2119,6 @@ def _qsa_sparse_launch_profile(
         block_n, target_splits, partial_warps = 16, 64, 4
     elif base_programs < 32:
         block_n, target_splits, partial_warps = 16, 32, 4
-    elif is_sm70:
-        # Pre-Ampere narrow tiles (issue #441): the GB300-shaped wide 2-warp
-        # tiles cannot hide the emulated bf16 latency on V100. 16-column
-        # profiles win every prefill regime there (community-measured
-        # 1.2-2.6x on production Qwen3.8 serving); superseded if the
-        # upstream dispatch PR lands with different numbers.
-        if base_programs <= 256:
-            block_n, target_splits, partial_warps = 16, 8, 4
-        elif base_programs <= 512:
-            block_n, target_splits, partial_warps = 16, 4, 4
-        else:
-            block_n, target_splits, partial_warps = 16, 1, 4
     elif base_programs <= 256:
         block_n, target_splits, partial_warps = 64, 8, 2
     elif base_programs <= 512:
