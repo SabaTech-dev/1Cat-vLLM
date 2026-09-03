@@ -691,22 +691,24 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_quant_mode=quant_mode,
                 sliding_window=self.sliding_window,
             )
-        elif self.kv_cache_dtype == "int4_per_token_head":
-            # TRITON_PAGED-only packed int4 KV: the head slot is
-            # D//2 data bytes (two nibbles per byte) plus a trailing
-            # fp32 scale, so the slot size already covers the scales
-            # and the page budget needs no separate scale term.
+        elif self.kv_cache_dtype == "int8k_int4v_per_token_head":
+            # TRITON_PAGED-only hybrid packed KV: K = int8 rows
+            # (head_size + 4 bytes fp32 scale), V = packed int4 nibbles
+            # (head_size//2 + 4). The trailing scales live inside each
+            # slot, so the page budget needs no separate scale term.
             if self.attn_backend.get_name() != "TRITON_PAGED":
                 raise ValueError(
-                    "int4_per_token_head KV cache requires the TRITON_PAGED backend"
+                    "int8k_int4v_per_token_head KV cache requires the "
+                    "TRITON_PAGED backend"
                 )
             if self.head_size % 2 != 0 or self.head_size_v % 2 != 0:
-                raise ValueError("int4_per_token_head requires an even head size")
-            packed = self.head_size // 2 + 4
+                raise ValueError(
+                    "int8k_int4v_per_token_head requires an even head size"
+                )
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
-                head_size=packed,
+                head_size=self.head_size + 4,
                 head_size_v=self.head_size_v // 2 + 4,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,

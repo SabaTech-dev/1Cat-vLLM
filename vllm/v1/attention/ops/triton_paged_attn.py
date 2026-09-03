@@ -43,18 +43,20 @@ def _store_kvcache_paged_kernel(
     k_block_stride,
     v_block_stride,
     num_kv_heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    head_dim_padded: tl.constexpr,
+    k_head_dim: tl.constexpr,
+    k_head_dim_padded: tl.constexpr,
+    v_head_dim: tl.constexpr,
+    v_head_dim_padded: tl.constexpr,
     block_size: tl.constexpr,
 ):
     """Store keys and values into the paged KV cache.
 
-    Grid layout: (num_tokens, num_kv_heads). Each program copies the
-    head_dim elements of one (token, head) pair from the dense projection
-    output into its paged cache slot. Tokens with slot == -1 (padding) are
-    skipped. head_dim_padded is next_power_of_2(head_dim); lanes beyond
-    head_dim are masked off so non-power-of-2 packed slots (int4) store
-    correctly.
+    Grid layout: (num_tokens, num_kv_heads). Each program copies one
+    (token, head) pair into its paged cache slot. Tokens with slot == -1
+    (padding) are skipped. K and V slots may have different widths (the
+    hybrid int8/int4 layout); head_dim_padded values are
+    next_power_of_2(head_dim) with the excess lanes masked off so
+    non-power-of-2 packed slots (int4) store correctly.
     """
     token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -66,22 +68,24 @@ def _store_kvcache_paged_kernel(
     block_idx = slot_idx // block_size
     block_offset = slot_idx % block_size
 
-    offs_d = tl.arange(0, head_dim_padded)
-    mask_d = offs_d < head_dim
-    # Input: (num_tokens, num_kv_heads, head_dim), assumed contiguous.
-    input_offset = token_idx * num_kv_heads * head_dim + head_idx * head_dim + offs_d
+    offs_k = tl.arange(0, k_head_dim_padded)
+    mask_k = offs_k < k_head_dim
+    offs_v = tl.arange(0, v_head_dim_padded)
+    mask_v = offs_v < v_head_dim
+    input_offset_k = token_idx * num_kv_heads * k_head_dim + head_idx * k_head_dim + offs_k
+    input_offset_v = token_idx * num_kv_heads * v_head_dim + head_idx * v_head_dim + offs_v
     k_offset = block_idx * k_block_stride + (
-        block_offset * num_kv_heads * head_dim
-        + head_idx * head_dim
-        + offs_d
+        block_offset * num_kv_heads * k_head_dim
+        + head_idx * k_head_dim
+        + offs_k
     )
     v_offset = block_idx * v_block_stride + (
-        block_offset * num_kv_heads * head_dim
-        + head_idx * head_dim
-        + offs_d
+        block_offset * num_kv_heads * v_head_dim
+        + head_idx * v_head_dim
+        + offs_v
     )
-    key = tl.load(key_ptr + input_offset, mask=mask_d, other=0)
-    value = tl.load(value_ptr + input_offset, mask=mask_d, other=0)
+    key = tl.load(key_ptr + input_offset_k, mask=mask_k, other=0)
+    value = tl.load(value_ptr + input_offset_v, mask=mask_v, other=0)
     tl.store(k_cache_ptr + k_offset, key)
     tl.store(v_cache_ptr + v_offset, value)
 
@@ -126,8 +130,10 @@ def store_kvcache_paged(
         k_cache.stride(0),
         v_cache.stride(0),
         num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        head_dim_padded=triton.next_power_of_2(head_dim),
+        k_head_dim=key.shape[-1],
+        k_head_dim_padded=triton.next_power_of_2(key.shape[-1]),
+        v_head_dim=value.shape[-1],
+        v_head_dim_padded=triton.next_power_of_2(value.shape[-1]),
         block_size=block_size,
     )
 
@@ -144,8 +150,11 @@ def _paged_decode_attention_kernel(
     scale_log2,
     k_block_stride,
     v_block_stride,
-    KV_INT4: tl.constexpr,
-    PACKED_HS: tl.constexpr,
+    K_INT8: tl.constexpr,
+    V_INT8: tl.constexpr,
+    V_INT4: tl.constexpr,
+    K_PACKED_HS: tl.constexpr,
+    V_PACKED_HS: tl.constexpr,
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -180,10 +189,10 @@ def _paged_decode_attention_kernel(
     q_offset = qo * num_heads * head_dim + head_idx * head_dim + offs_d
     q = tl.load(query_ptr + q_offset).to(tl.float32)
 
-    # Packed int4 KV: even/odd head lanes split so the byte loads stay
+    # Packed V int4: even/odd head lanes split so the byte loads stay
     # [head_dim//2, BLOCK_N]; masked/zeroed slots carry a zero fp32 scale
     # which zeroes their dequantized contribution.
-    if KV_INT4:
+    if V_INT4:
         qe, qo_ = tl.split(tl.reshape(q, (head_dim // 2, 2)))
         acc_e = tl.zeros([head_dim // 2], dtype=tl.float32)
         acc_o = tl.zeros([head_dim // 2], dtype=tl.float32)
@@ -213,33 +222,29 @@ def _paged_decode_attention_kernel(
         valid = valid & (physical_block != -1)
         physical_block = tl.where(valid, physical_block, 0).to(tl.int64)
 
-        if KV_INT4:
-            # Cache head slot: PACKED_HS = head_dim//2 data bytes plus a
-            # trailing fp32 scale (4 bytes) per (slot, head).
+        if K_INT8:
+            # Cache K head slot: head_dim int8 bytes plus a trailing fp32
+            # scale per (slot, head).
             slot_base_k = (
-                offs_in_block[None, :] * (num_kv_heads * PACKED_HS)
-                + kv_head_idx * PACKED_HS
+                offs_in_block[None, :] * (num_kv_heads * K_PACKED_HS)
+                + kv_head_idx * K_PACKED_HS
             )
             byte_off_k = (
                 physical_block[None, :] * k_block_stride
                 + slot_base_k
-                + offs_half[:, None]
+                + offs_d[:, None]
             )
             raw_k = tl.load(k_cache_ptr + byte_off_k, mask=valid[None, :],
                             other=0)
-            k_lo = (raw_k & 0xF).to(tl.float32) - 8.0
-            k_hi = ((raw_k >> 4) & 0xF).to(tl.float32) - 8.0
             scale_ptrs = tl.cast(
                 k_cache_ptr + physical_block[None, :] * k_block_stride
-                + slot_base_k + head_dim // 2,
+                + slot_base_k + head_dim,
                 tl.pointer_type(tl.uint32),
             )
             k_scale = tl.load(scale_ptrs, mask=valid[None, :],
                               other=0).to(tl.float32, bitcast=True)
-            ke = (k_lo * k_scale).to(tl.float16)
-            ko = (k_hi * k_scale).to(tl.float16)
-            score = (tl.sum(qe[:, None] * ke, axis=0)
-                     + tl.sum(qo_[:, None] * ko, axis=0)) * scale_log2
+            k = raw_k.to(tl.int8).to(tl.float32) * k_scale
+            score = tl.sum(q[:, None] * k, axis=0) * scale_log2
         else:
             # Cache: (num_blocks, block_size, num_kv_heads, head_dim)
             kv_offset_k = (
@@ -259,7 +264,7 @@ def _paged_decode_attention_kernel(
         alpha = tl.math.exp2(m_i - m_new)
         p = tl.math.exp2(qk - m_new)
 
-        if KV_INT4:
+        if V_INT4:
             acc_e = acc_e * alpha
             acc_o = acc_o * alpha
         else:
@@ -267,11 +272,32 @@ def _paged_decode_attention_kernel(
         l_i = l_i * alpha
 
         weight = tl.where(valid, p, 0.0)
-        if KV_INT4:
+        if V_INT8:
+            slot_base_v = (
+                offs_in_block[None, :] * (num_kv_heads * V_PACKED_HS)
+                + kv_head_idx * V_PACKED_HS
+            )
             byte_off_v = (
                 physical_block[None, :] * v_block_stride
-                + offs_in_block[None, :] * (num_kv_heads * PACKED_HS)
-                + kv_head_idx * PACKED_HS
+                + slot_base_v
+                + offs_d[:, None]
+            )
+            raw_v = tl.load(v_cache_ptr + byte_off_v, mask=valid[None, :],
+                            other=0)
+            scale_ptrv = tl.cast(
+                v_cache_ptr + physical_block[None, :] * v_block_stride
+                + slot_base_v + head_dim,
+                tl.pointer_type(tl.uint32),
+            )
+            v_scale = tl.load(scale_ptrv, mask=valid[None, :],
+                              other=0).to(tl.float32, bitcast=True)
+            v = raw_v.to(tl.int8).to(tl.float32) * v_scale
+            acc = acc + tl.sum(weight[None, :] * v, axis=1)
+        elif V_INT4:
+            byte_off_v = (
+                physical_block[None, :] * v_block_stride
+                + offs_in_block[None, :] * (num_kv_heads * V_PACKED_HS)
+                + kv_head_idx * V_PACKED_HS
                 + offs_half[:, None]
             )
             raw_v = tl.load(v_cache_ptr + byte_off_v, mask=valid[None, :],
@@ -280,8 +306,8 @@ def _paged_decode_attention_kernel(
             v_hi = ((raw_v >> 4) & 0xF).to(tl.float32) - 8.0
             scale_ptrsv = tl.cast(
                 v_cache_ptr + physical_block[None, :] * v_block_stride
-                + offs_in_block[None, :] * (num_kv_heads * PACKED_HS)
-                + kv_head_idx * PACKED_HS
+                + offs_in_block[None, :] * (num_kv_heads * V_PACKED_HS)
+                + kv_head_idx * V_PACKED_HS
                 + head_dim // 2,
                 tl.pointer_type(tl.uint32),
             )
@@ -305,7 +331,7 @@ def _paged_decode_attention_kernel(
 
         m_i = m_new
 
-    if KV_INT4:
+    if V_INT4:
         output = tl.reshape(tl.join(acc_e / l_i, acc_o / l_i), (head_dim,))
     else:
         output = acc / l_i
@@ -326,7 +352,9 @@ def paged_decode_attention(
     head_dim: int,
     block_size: int,
     scale: float,
-    kv_int4: bool = False,
+    k_int8: bool = False,
+    v_int8: bool = False,
+    v_int4: bool = False,
 ) -> None:
     """Decode attention over the paged KV cache.
 
@@ -364,8 +392,11 @@ def paged_decode_attention(
         scale * _SM_SCALE_LOG2E_CONSTANT,
         k_cache.stride(0),
         v_cache.stride(0),
-        KV_INT4=kv_int4,
-        PACKED_HS=head_dim // 2 + 4,
+        K_INT8=k_int8,
+        V_INT8=v_int8,
+        V_INT4=v_int4,
+        K_PACKED_HS=head_dim + 4,
+        V_PACKED_HS=head_dim + 4 if v_int8 else head_dim // 2 + 4,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
@@ -387,8 +418,11 @@ def _varlen_paged_prefill_attention_kernel(
     scale_log2,
     k_block_stride,
     v_block_stride,
-    KV_INT4: tl.constexpr,
-    PACKED_HS: tl.constexpr,
+    K_INT8: tl.constexpr,
+    V_INT8: tl.constexpr,
+    V_INT4: tl.constexpr,
+    K_PACKED_HS: tl.constexpr,
+    V_PACKED_HS: tl.constexpr,
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -441,7 +475,7 @@ def _varlen_paged_prefill_attention_kernel(
     q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
 
     offs_half = tl.arange(0, head_dim // 2)
-    if KV_INT4:
+    if V_INT4:
         qe, qo_ = tl.split(tl.reshape(q, (BLOCK_M, head_dim // 2, 2)))
         acc_e = tl.zeros([BLOCK_M, head_dim // 2], dtype=tl.float32)
         acc_o = tl.zeros([BLOCK_M, head_dim // 2], dtype=tl.float32)
@@ -466,32 +500,65 @@ def _varlen_paged_prefill_attention_kernel(
         valid = valid & (physical_block != -1)
         physical_block = tl.where(valid, physical_block, 0).to(tl.int64)
 
-        if KV_INT4:
-            slot_base = (
-                offs_in_block[:, None] * (num_kv_heads * PACKED_HS)
-                + kv_head_idx * PACKED_HS
+        if K_INT8:
+            # K head slot: head_dim int8 bytes + trailing fp32 scale
+            slot_base_k = (
+                offs_in_block[:, None] * (num_kv_heads * K_PACKED_HS)
+                + kv_head_idx * K_PACKED_HS
             )
             byte_off_t = (
                 physical_block[None, :] * k_block_stride
-                + slot_base.T
-                + offs_half[:, None]
+                + slot_base_k.T
+                + offs_d[:, None]
             )
             raw_k = tl.load(k_cache_ptr + byte_off_t, mask=valid[None, :],
                             other=0)
-            k_lo = (raw_k & 0xF).to(tl.float32) - 8.0
-            k_hi = ((raw_k >> 4) & 0xF).to(tl.float32) - 8.0
             scale_ptrk = tl.cast(
                 k_cache_ptr + physical_block[None, :] * k_block_stride
-                + slot_base.T + head_dim // 2,
+                + slot_base_k.T + head_dim,
                 tl.pointer_type(tl.uint32),
             )
             k_scale = tl.load(scale_ptrk, mask=valid[None, :],
                               other=0).to(tl.float32, bitcast=True)
-            ke = (k_lo * k_scale).to(tl.float16)
-            ko = (k_hi * k_scale).to(tl.float16)
+            k = (raw_k.to(tl.int8).to(tl.float32) * k_scale).to(tl.float16)
+        else:
+            kv_offset_t = (
+                physical_block[None, :] * k_block_stride
+                + offs_in_block[None, :] * (num_kv_heads * head_dim)
+                + kv_head_idx * head_dim
+                + offs_d[:, None]
+            )
+            k = tl.load(k_cache_ptr + kv_offset_t, mask=valid[None, :],
+                        other=0.0)
+        if V_INT8:
+            slot_base_v = (
+                offs_in_block[:, None] * (num_kv_heads * V_PACKED_HS)
+                + kv_head_idx * V_PACKED_HS
+            )
             byte_off_n = (
                 physical_block[:, None] * v_block_stride
-                + slot_base
+                + slot_base_v
+                + offs_d[None, :]
+            )
+            raw_v = tl.load(v_cache_ptr + byte_off_n, mask=valid[:, None],
+                            other=0)
+            scale_ptrv = tl.cast(
+                v_cache_ptr + physical_block[:, None] * v_block_stride
+                + slot_base_v + head_dim,
+                tl.pointer_type(tl.uint32),
+            )
+            v_scale = tl.load(scale_ptrv, mask=valid[:, None],
+                              other=0).to(tl.float32, bitcast=True)
+            v = (raw_v.to(tl.int8).to(tl.float32) * v_scale).to(tl.float16)
+        elif V_INT4:
+            # V head slot: head_dim//2 packed int4 bytes + fp32 scale
+            slot_base_v = (
+                offs_in_block[:, None] * (num_kv_heads * V_PACKED_HS)
+                + kv_head_idx * V_PACKED_HS
+            )
+            byte_off_n = (
+                physical_block[:, None] * v_block_stride
+                + slot_base_v
                 + offs_half[None, :]
             )
             raw_v = tl.load(v_cache_ptr + byte_off_n, mask=valid[:, None],
@@ -500,7 +567,7 @@ def _varlen_paged_prefill_attention_kernel(
             v_hi = ((raw_v >> 4) & 0xF).to(tl.float32) - 8.0
             scale_ptrv = tl.cast(
                 v_cache_ptr + physical_block[:, None] * v_block_stride
-                + slot_base + head_dim // 2,
+                + slot_base_v + head_dim // 2,
                 tl.pointer_type(tl.uint32),
             )
             v_scale = tl.load(scale_ptrv, mask=valid[:, None],
@@ -508,27 +575,16 @@ def _varlen_paged_prefill_attention_kernel(
             ve = (v_lo * v_scale).to(tl.float16)
             vo = (v_hi * v_scale).to(tl.float16)
         else:
-            # Cache: (num_blocks, block_size, num_kv_heads, head_dim)
-            # K^T tile: (head_dim, BLOCK_N)
-            kv_offset_t = (
-                physical_block[None, :] * k_block_stride
-                + offs_in_block[None, :] * (num_kv_heads * head_dim)
-                + kv_head_idx * head_dim
-                + offs_d[:, None]
-            )
-            # V tile: (BLOCK_N, head_dim)
             kv_offset_n = (
                 physical_block[:, None] * v_block_stride
                 + offs_in_block[:, None] * (num_kv_heads * head_dim)
                 + kv_head_idx * head_dim
                 + offs_d[None, :]
             )
+            v = tl.load(v_cache_ptr + kv_offset_n, mask=valid[:, None],
+                        other=0.0)
 
-        if KV_INT4:
-            qk = (tl.dot(qe, ke) + tl.dot(qo_, ko)).to(tl.float32) * scale_log2
-        else:
-            k = tl.load(k_cache_ptr + kv_offset_t, mask=valid[None, :], other=0.0)
-            qk = tl.dot(q, k).to(tl.float32) * scale_log2
+        qk = tl.dot(q, k).to(tl.float32) * scale_log2
 
         # Causal mask on global positions; masked lanes -> -inf.
         q_pos = context_len + offs_m[:, None]
@@ -540,24 +596,21 @@ def _varlen_paged_prefill_attention_kernel(
         alpha = tl.math.exp2(m_i - m_new)
         p = tl.math.exp2(qk - m_new[:, None])
 
-        acc = acc * alpha[:, None]
-
         # Zero-out padded lanes so -inf -> exp2(-inf) == 0 contributes nothing.
         p = tl.where(causal, p, 0.0)
-        if KV_INT4:
+        if V_INT4:
             p16 = p.to(tl.float16)
             pe = tl.dot(p16, ve)
             po = tl.dot(p16, vo)
             acc_e = acc_e * alpha[:, None] + pe
             acc_o = acc_o * alpha[:, None] + po
         else:
-            v = tl.load(v_cache_ptr + kv_offset_n, mask=valid[:, None], other=0.0)
             acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v).to(tl.float32)
 
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_new
 
-    if KV_INT4:
+    if V_INT4:
         acc = tl.reshape(
             tl.join(acc_e / l_i[:, None], acc_o / l_i[:, None]),
             (BLOCK_M, head_dim),
@@ -587,7 +640,9 @@ def varlen_paged_prefill_attention(
     block_size: int,
     max_query_len: int,
     scale: float,
-    kv_int4: bool = False,
+    k_int8: bool = False,
+    v_int8: bool = False,
+    v_int4: bool = False,
 ) -> None:
     """Varlen prefill attention over the paged KV cache.
 
@@ -631,8 +686,11 @@ def varlen_paged_prefill_attention(
         scale * _SM_SCALE_LOG2E_CONSTANT,
         k_cache.stride(0),
         v_cache.stride(0),
-        KV_INT4=kv_int4,
-        PACKED_HS=head_dim // 2 + 4,
+        K_INT8=k_int8,
+        V_INT8=v_int8,
+        V_INT4=v_int4,
+        K_PACKED_HS=head_dim + 4,
+        V_PACKED_HS=head_dim + 4 if v_int8 else head_dim // 2 + 4,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,

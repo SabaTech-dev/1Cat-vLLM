@@ -42,6 +42,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.utils import get_num_attention_heads_from_layers
+from vllm.v1.kv_cache_interface import kv_cache_uses_per_token_head_scales
 from vllm.v1.attention.ops.triton_paged_attn import (
     paged_decode_attention,
     store_kvcache_paged,
@@ -49,15 +50,30 @@ from vllm.v1.attention.ops.triton_paged_attn import (
 )
 
 
-def _quantize_int4_pth(x: torch.Tensor) -> torch.Tensor:
-    """Per-(token, head) symmetric int4 quantization for the paged cache.
+def _quantize_int8_pth(x: torch.Tensor) -> torch.Tensor:
+    """Per-(token, head) symmetric int8 quantization (K side).
 
-    x: (num_tokens, num_kv_heads, head_dim) fp16/fp32.
-    Returns uint8 (num_tokens, num_kv_heads, head_dim//2 + 4): two nibbles
-    per byte (low nibble = even lane) plus a trailing fp32 scale such that
-    data = round(x / scale) + 8 fits [0, 15].
+    x: (num_tokens, num_kv_heads, head_dim) -> int8
+    (num_tokens, num_kv_heads, head_dim + 4): full-resolution bytes plus a
+    trailing fp32 scale. The int8 range (127) tolerates the post-RoPE
+    key outliers that break symmetric int4.
     """
-    hs = x.shape[-1]
+    amax = x.abs().amax(dim=-1, keepdim=True).float()
+    scale = (amax / 127.0).clamp_(min=1e-8).to(torch.float32)
+    q = torch.clamp(torch.round(x.float() / scale), -127, 127).to(torch.int8)
+    scale_bytes = scale.contiguous().view(torch.uint8)
+    return torch.cat([q.view(torch.uint8), scale_bytes], dim=-1)
+
+
+def _quantize_int4_pth(x: torch.Tensor) -> torch.Tensor:
+    """Per-(token, head) symmetric int4 quantization (V side).
+
+    x: (num_tokens, num_kv_heads, head_dim) -> uint8
+    (num_tokens, num_kv_heads, head_dim//2 + 4): two nibbles per byte
+    (low nibble = even lane) plus a trailing fp32 scale such that
+    data = round(x / scale) + 8 fits [0, 15]. Values (no RoPE) have
+    tight distributions and survive int4.
+    """
     amax = x.abs().amax(dim=-1, keepdim=True).float()
     scale = (amax / 7.0).clamp_(min=1e-8).to(torch.float32)
     q = torch.clamp(torch.round(x.float() / scale), -7, 7).to(torch.uint8) + 8
@@ -179,7 +195,8 @@ class TritonPagedBackend(AttentionBackend):
     supported_kv_cache_dtypes: list[CacheDType] = [
         "auto",
         "float16",
-        "int4_per_token_head",
+        "int8_per_token_head",
+        "int8k_int4v_per_token_head",
     ]
 
     # The KV cache update runs through do_kv_cache_update (the fork's
@@ -221,6 +238,17 @@ class TritonPagedBackend(AttentionBackend):
         # K and V halves split via unbind(1). The kernels in
         # ops.triton_paged_attn then operate on the
         # (num_blocks, block_size, num_kv_heads, head_size) views.
+        # Per-token-head modes carry the fp32 scale inline in the last 4
+        # bytes of each head slot (mirrors triton_attn), so pad the head
+        # to keep the allocation and this view on the same slot width.
+        if kv_cache_uses_per_token_head_scales(cache_dtype_str):
+            from vllm.utils.torch_utils import (
+                STR_DTYPE_TO_TORCH_DTYPE,
+                get_dtype_size,
+            )
+
+            cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype_str]
+            head_size += get_dtype_size(torch.float32) // get_dtype_size(cache_dtype)
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -278,7 +306,16 @@ class TritonPagedImpl(AttentionImpl):
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.kv_cache_dtype = kv_cache_dtype
-        self.kv_int4 = kv_cache_dtype == "int4_per_token_head"
+        if kv_cache_dtype == "int8k_int4v_per_token_head":
+            # The K and V packed slots need different widths (D+4 vs
+            # D//2+4) while the engine carves a uniform slot per side;
+            # store-side input/cache width separation is pending.
+            raise NotImplementedError(
+                "int8k_int4v_per_token_head is not wired yet; use "
+                "int8_per_token_head (2x context) on TRITON_PAGED"
+            )
+        self.kv_quant = kv_cache_dtype == "int8_per_token_head"
+        self.kv_int8_both = kv_cache_dtype == "int8_per_token_head"
         self.attn_type = attn_type
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
@@ -360,7 +397,9 @@ class TritonPagedImpl(AttentionImpl):
                 head_dim=self.head_size,
                 block_size=kv_cache.shape[2],
                 scale=self.scale,
-                kv_int4=self.kv_int4,
+                k_int8=self.kv_quant,
+                v_int8=self.kv_int8_both,
+                v_int4=self.kv_quant and not self.kv_int8_both,
             )
         else:
             # Prefill / extend (also used for multi-token decode steps,
@@ -381,7 +420,9 @@ class TritonPagedImpl(AttentionImpl):
                 block_size=kv_cache.shape[2],
                 max_query_len=attn_metadata.max_query_len,
                 scale=self.scale,
-                kv_int4=self.kv_int4,
+                k_int8=self.kv_quant,
+                v_int8=self.kv_int8_both,
+                v_int4=self.kv_quant and not self.kv_int8_both,
             )
         return output
 
@@ -403,13 +444,16 @@ class TritonPagedImpl(AttentionImpl):
         if kv_cache.numel() == 0:
             return
         key_cache, value_cache = kv_cache.unbind(1)
-        if self.kv_int4:
-            # Packed uint8 slots: quantize to (head_dim//2 + 4)-byte rows;
-            # the store kernel handles the non-power-of-2 slot via its
-            # padded arange and skips slot == -1 natively (capture-safe).
-            key, value = (
-                _quantize_int4_pth(t) for t in (key, value)
-            )
+        if self.kv_quant:
+            # Quantized slots with in-tail fp32 scales: K = int8 rows
+            # (head_dim+4); V = int4 nibble rows (head_dim//2+4) for the
+            # hybrid dtype, or int8 rows for int8_per_token_head. The
+            # store kernel skips slot == -1 natively (capture-safe).
+            key = _quantize_int8_pth(key)
+            if self.kv_int8_both:
+                value = _quantize_int8_pth(value)
+            else:
+                value = _quantize_int4_pth(value)
         store_kvcache_paged(
             key=key,
             value=value,
