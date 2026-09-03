@@ -342,6 +342,29 @@ Piezas a portar (por tamaño):
    permute de value-heads GDN, replicación KV para TP > nkv.
 4. Regression runner de su flota verificado como harness.
 
+#### F9.1 RESULTADO (2026-09-03): HauhauCS AWQ-MTP SIRVE en vLLM/V100
+
+El checkpoint de produccion (twolven Qwen3.8-27B-Uncensored-HauhauCS-
+Aggressive-AWQ-MTP, 20 GB) CARGA Y SIRVE en TRITON_PAGED con
+`VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND=1` (el scheme WNA16 de 1.5.0
+baja su min capability a 70 con el env; el gate "Min capability 75"
+documentado antes era solo el default del env, no un limite de
+hardware). OOM bajo captura de graphs a util 0.92/4096 -> sirve en
+eager con util 0.97/2048 (tuning de memoria pendiente).
+
+Gates de calidad (bateria, TP1 eager):
+- AWQ + KV fp16: PPL 3.0414, greedy coherente y de alta calidad
+  ("una de las ciudades mas visitadas del mundo. Sus ...") -> SALUDABLE
+- AWQ + KV int8-PTH: PPL 215, 0/20 -> ROTO para este checkpoint
+  (funcionaba en QUASAR NVFP4 +7.6%): la degradacion int8-PTH es
+  DEPENDIENTE DEL MODELO, no un bug universal del kernel. Sospechoso:
+  distribucion K/V del finetune HauhauCS (aggressive) bajo escala
+  simetrica amax/127.
+
+Configuracion de produccion recomendada para este checkpoint:
+TURBOMIND=1 + KV fp16. El int8-PTH requiere calibracion (per-channel)
+antes de usarse en modelos sensibles.
+
 Hallazgos transferibles documentados en #441/humanjesse:
 - Spec-decode en V100 es net-negativo hoy (flash_attn_v100 no sostiene
   graphs bajo spec → PIECEWISE ~46 tok/s; triton_attn ~77 vs ~100
