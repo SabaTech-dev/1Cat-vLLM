@@ -24,7 +24,7 @@ References:
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
@@ -34,6 +34,7 @@ from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import (
     AttentionBackend,
+    AttentionCGSupport,
     AttentionImpl,
     AttentionLayer,
     AttentionMetadataBuilder,
@@ -91,10 +92,14 @@ class TritonPagedMetadata:
 
 
 class TritonPagedMetadataBuilder(AttentionMetadataBuilder[TritonPagedMetadata]):
-    # TODO(f1): CUDA graph support (requires padded capture buffers and a
-    # graph-safe kernel launch). Until then the engine runs this backend
-    # in eager mode (AttentionCGSupport.NEVER).
-    pass
+    # CUDA graphs: attempted 2026-09-02 and reverted. Both piecewise and
+    # decode-only capture deterministically corrupted the first replayed
+    # request on V100 (Qwen3-0.6B, "Francia" prompt), while later requests
+    # stayed coherent. Root cause not yet isolated (capture-time kernel
+    # constexprs vs serving-time buffer layout are the prime suspects).
+    # The backend is fully functional in eager mode; keep graphs off until
+    # the capture path is instrumented properly.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
 
     def __init__(
         self,
@@ -132,6 +137,16 @@ class TritonPagedMetadataBuilder(AttentionMetadataBuilder[TritonPagedMetadata]):
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
         )
+
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: "CommonAttentionMetadata"
+    ) -> TritonPagedMetadata:
+        attn_metadata = self.build(0, common_attn_metadata)
+        # Capture speed: real seq_lens make the decode kernel walk every KV
+        # block of max_model_len for every capture size. Content is refreshed
+        # from the runner's persistent buffers before each replay.
+        attn_metadata.seq_lens.fill_(1)
+        return attn_metadata
 
 
 class TritonPagedBackend(AttentionBackend):

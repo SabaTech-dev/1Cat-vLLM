@@ -126,8 +126,7 @@ backends arrancaron junto a la carga productiva sin impacto.
 ## Qué queda (orden propuesto)
 
 1. ~~**Prueba funcional end-to-end en V100**~~ (HECHA 2026-09-02: paridad greedy byte-identica vs FLASH_ATTN_V100 tras el fix de strides a327d45b7).
-2. **CUDA Graphs**: el builder niega el soporte. Habilitarlo exige
-   buffers de captura con padding y launches seguras para grafos.
+2. ~~**CUDA Graphs**~~ (INTENTADO y REVERTIDO 2026-09-02: corrompia la primera peticion en piecewise y decode-only; causa raiz no aislada. Ver seccion arriba.)
 3. ~~**Autotuning**~~ (HECHO 2026-09-02: decode BN=128, prefill BM=16/BN=64; datos en f1-autotune.json). Queda opcional: partir el bucle KV en el bloque diagonal.
 4. **Rendimiento decode**: el kernel decode es 1 fila por programa; si
    el batch pequeño deja la GPU ociosa, evaluar split-K (varios
@@ -165,6 +164,29 @@ tuning (frontera Triton-vs-CUDA-hand-tuned en Volta).
 **Tuning aplicado** (f1-autotune.json, mediana de 20 corridas CUDA
 events): decode BLOCK_N 64->128 (-30% a 4k ctx); prefill BM 32->16
 (2.6x kernel; BM>=64 colapsa por spilling de los 64KB smem de Volta).
+
+## CUDA Graphs: intento y reversion (2026-09-02)
+
+Se implemento soporte (`AttentionCGSupport.ALWAYS` +
+`build_for_cudagraph_capture` al estilo triton_attn). Resultado:
+corrupcion determinista de la PRIMERA peticion reproducida en un
+graph ("La capital de Francia" -> salida sin sentido) con captura
+piecewise y tambien con decode-only (`UNIFORM_SINGLE_TOKEN_DECODE`);
+las peticiones posteriores eran coherentes. Causa raiz no aislada
+(sospechosos: constexprs de kernel fijados en captura vs layout de
+los buffers persistentes en serving). REVERTIDO a NEVER: el backend
+es plenamente funcional en eager; graphs queda como limitacion
+documentada hasta instrumentar el path de captura.
+
+## Modelo de produccion en vLLM/Volta: infeasible (2026-09-02)
+
+HauhauCS Qwen3.8-27B (twolven AWQ-MTP, compressed-tensors W4A16):
+el scheme exige capability >= 7.5 (Turing); V100 = 7.0 -> no carga.
+La alternativa local BF16 (~50 GB, qflash/hf) no cabe en 32 GB.
+CONCLUSION para el plan de adopcion: servir la familia HauhauCS en
+V100 requiere una cuantizacion compatible con SM70 (GPTQ con kernel
+viejo o similar) o permanecer en llama.cpp. Los gates A/B y tuning
+de F1 se validaron con Qwen3-0.6B fp16 (dedicada).
 
 ## Riesgos
 
