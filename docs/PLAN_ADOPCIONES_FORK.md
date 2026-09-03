@@ -136,12 +136,18 @@ independiente y puede intercalarse si hay ventana de GPU.
 Peuqui reporta tuning medido en producción (2×RTX 8000 + 3×V100,
 Qwen3.8 bajo llama-swap). Estado de adopción:
 
-1. **QSA dispatch pre-Ampere — ADOPTADO (2026-09-03, d9646abcc)**: rama
-   de capability en `qwen4_exp/amd/ops/qsa.py` (el archivo vivo en
-   pre-Ampere; el gemelo `nvidia/` es código muerto ahí): tiles
-   estrechos de 4 warps (16/8/4, 16/4/4, 16/1/4 según base_programs).
-   Su medición: 19.3× en V100 para prefill de 2048 tokens (27.3 ms vs
-   527 ms con los tiles GB300).
+1. **QSA dispatch pre-Ampere — ADOPTADO, CORREGIDO (2026-09-03)**:
+   CORRECCIÓN de ruta: el archivo vivo en CUDA es
+   `qwen4_exp/nvidia/ops/qsa.py` (el árbol `amd/` es la vía ROCm — la
+   nota original de #441 estaba invertida; el primer parche tocó el
+   archivo equivocado y fue re-ubicado tras el rebase, commit
+   0373df2ce). Ahora: rama `is_sm70` en la tabla de dispatch del
+   archivo vivo con tiles estrechos de 4 warps (16/8/4, 16/4/4, 16/1/4
+   según base_programs). Datos finales de Peuqui: narrow-16 gana TODOS
+   los regímenes de prefill en V100 (1.2-2.6×) y RTX 8000 (1.16-1.20×)
+   con numérica idéntica; el tile de 64 columnas ni siquiera lanza en
+   SM75 a D=256 (OutOfResources vs 64 KiB smem). Su PR upstream está en
+   camino — cuando aterrice, evaluar soltar nuestro parche local.
 2. **flash_attn_v100 prefill tile 64×80 (−13 % en D=128) — PENDIENTE**:
    el tile 32×176 está horneado en el wheel compilado
    `flash_attn_v100`; hace falta la fuente del paquete (Peuqui ofrece
