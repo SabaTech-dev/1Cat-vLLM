@@ -84,3 +84,29 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
   elimino sm_70); toolchain del fork = wheel 1.5.0 oficial.
 - El alias de :8009 mantiene compatibilidad de consumidores; revert de
   swaps via los .bak timestampados en llm/config/.
+
+## 2026-09-03 — Round F2.4/F9.1 tuning (int8 calibration + graphs + long context)
+
+- **int8 intra-row outliers**: the amax scale collapses when 1 channel
+  dominates the row (HauhauCS: row-amax p50=0.0, max=89.7). Percentile
+  clip (k-th largest, 5%-of-amax floor) rescued PPL 215 -> 4.21 and
+  improved QUASAR +7.6% -> +6.7%. Default clip 1%; sweep showed the
+  optimum is narrow (0.2% / 5% both worse).
+- **TurboMind GEMM is not CUDA-graph-safe**: fits memory with
+  batched-tokens=1024, but outputs corrupt under graphs (PPL 1.6M vs
+  eager 3.04). Workspace is cached per-stream (StreamWorkspaceKey).
+  AWQ = eager until fixed upstream.
+- **KV allocation OOM is driven by max_num_batched_tokens**, not util:
+  default 8192 inflates the profiled activation peak; capping it to
+  1024 frees the KV sizing. Four util-only retries (0.85-0.97) all
+  failed identically.
+- **TRITON_PAGED prefill stalls beyond ~16K context** (TP1 eager):
+  6.1K OK, 16K/32K/55K no observable progress in 20-25 min. Long-context
+  capacity (63K int8) is unreachable until diagnosed.
+- **Orphaned EngineCore**: killing the parent bash timeout leaves the
+  spawned VLLM::EngineCore holding 31GB. Always `pkill -9 -f
+  VLLM::EngineCore` between runs and check nvidia-smi.
+- **/tmp is ephemeral across host crashes**: the host crash wiped
+  /tmp/opencode (scripts + result JSONs). Everything critical must live
+  in git (tools/sm70_validation/) or Engram; results transcribed to docs
+  immediately.
