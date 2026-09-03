@@ -121,6 +121,29 @@ F5 (publicación) al final, con los números de F1–F4
 F1 es prerrequisito de F2/F4 (los benches de calidad pasan por el backend nuevo). F3 es
 independiente y puede intercalarse si hay ventana de GPU.
 
+### Adopciones del issue #441 (usuario de producción, rig mixto Volta/Turing)
+
+Peuqui reporta tuning medido en producción (2×RTX 8000 + 3×V100,
+Qwen3.8 bajo llama-swap). Estado de adopción:
+
+1. **QSA dispatch pre-Ampere — ADOPTADO (2026-09-03, d9646abcc)**: rama
+   de capability en `qwen4_exp/amd/ops/qsa.py` (el archivo vivo en
+   pre-Ampere; el gemelo `nvidia/` es código muerto ahí): tiles
+   estrechos de 4 warps (16/8/4, 16/4/4, 16/1/4 según base_programs).
+   Su medición: 19.3× en V100 para prefill de 2048 tokens (27.3 ms vs
+   527 ms con los tiles GB300).
+2. **flash_attn_v100 prefill tile 64×80 (−13 % en D=128) — PENDIENTE**:
+   el tile 32×176 está horneado en el wheel compilado
+   `flash_attn_v100`; hace falta la fuente del paquete (Peuqui ofrece
+   diffs/PR). Restricción reportada: M múltiplo de 32 (48×112 y 80×48
+   dan resultados erróneos).
+3. **Verify multi-token**: el verify escala lineal con q (0.153/0.222/
+   0.632 ms para q=1/2/8 en H=4/HK=1/D=128, 31k KV) — apalanca el spec
+   decode en Volta; su fix de split-kv está propuesto upstream
+   (flash-attention #190). Referencia para F4.
+4. **TP heterogéneo sm70/sm75**: derivar la versión de FA por worker en
+   vez de por device 0 (vllm #54758). Referencia para despliegues mixtos.
+
 ## Fuera de alcance
 
 - Todo lo multimodal (vllm-omni), compute fp8/NVFP4, FA2/FA3, bfloat16 tensor cores.
