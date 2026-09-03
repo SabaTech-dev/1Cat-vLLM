@@ -875,17 +875,6 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 16, 64, 4
     elif base_programs < 32:
         block_n, target_splits, partial_warps = 16, 32, 4
-    elif (_cap := current_platform.get_device_capability()) is not None and _cap.major < 8:
-        # Pre-Ampere: the GB300-shaped wide 2-warp tiles cannot hide the
-        # emulated bf16 latency on sm70/sm75. Narrow 4-warp tiles measured
-        # 19.3x on V100 for 2048-token prefill chunks (issue #441,
-        # community-validated in production on a mixed Volta/Turing rig).
-        if base_programs <= 256:
-            block_n, target_splits, partial_warps = 16, 8, 4
-        elif base_programs <= 512:
-            block_n, target_splits, partial_warps = 16, 4, 4
-        else:
-            block_n, target_splits, partial_warps = 16, 1, 4
     elif base_programs <= 256:
         block_n, target_splits, partial_warps = 64, 8, 2
     elif base_programs <= 512:
