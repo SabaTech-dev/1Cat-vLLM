@@ -62,14 +62,15 @@ si la estabilidad lo compensa.
 off; unit test verifica reuso de los recién liberados). Commit 252d6b6b4.
 Punto 1 (INT4 KV en kernels TRITON_PAGED) y punto 2 (watermark) pendientes.
 
-**BUG DE ENGINE DESCUBIERTO (reportable upstream)**: con
-`gpu_memory_utilization` bajo (<= ~0.3 con Qwen3-0.6B fp16), la PRIMERA
-petición produce salida corrupta — independiente del backend de atención
-(reproducido en TRITON_PAGED y FLASH_ATTN_V100), de eager/graphs, de
-prefix caching on/off y de fifo/lifo. A util 0.85 (baterías F1) la salida
-es limpia. Sospecha: en pools de KV mínimos, la reserva del scheduler
-(`scheduler_reserve_full_isl`) deja bloques insuficientes para el ISL
-completo y el path de admisión corrompe el estado.
+**RETRACCIÓN (2026-09-03)**: el "bug de engine a util baja" de esta
+misma noche era un FALSO POSITIVO — no existe. Qwen3-0.6B es un modelo
+BASE y su completion raw de "La capital de Francia es" es "el
+**Estados Unidos**..." SIEMPRE (transformers puro lo reproduce); el
+"Paris" venia del path con chat template. Toda la matriz (util, backend,
+graphs/eager, fifo/lifo) era consistente: nunca hubo corrupcion. Los
+tests futuros deben usar canarios apropiados al API path o modelos
+instruct. Por la misma razon se RESTAURARON los CUDA Graphs (ver
+docs/f1-triton-paged-sm70.md): greedy 20/20 identico, decode 3.4-4.2x.
 
 **Objetivo**: duplicar contexto utilizable y reducir preemption.
 
