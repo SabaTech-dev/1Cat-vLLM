@@ -534,6 +534,28 @@ en docs/f1-triton-paged-sm70.md (items 4-6 cerrados: split-K
 innecesario, fp8 superseded por int8 PTH) y LESSONS.md sincronizada
 con las 12 lecciones 09-04.
 
+#### Bisect del deadlock del autotune GDN (2026-09-04)
+
+Matriz de overrides via env (server QUASAR, gdn triton, ctx 4096/12288):
+- `VLLM_SM70_GDN_KKT_BK=32` solo: INIT OK (unico sobreviviente)
+- `KKT_BK=64` solo: CUELGA (0% CPU, sync bloqueada en init)
+- `KKT_BK=32,64` (mismos valores que el default): CUELGA
+- `KKT_BK=32,64,128`: CUELGA
+- `KKT_BK=32 + DELTA_H_BV=32`: CUELGA
+
+Conclusion: (a) el camino del env funciona (BK=32 solo corre), (b)
+cualquier cambio de lista que dispare RE-BENCHMARKING del autotune en
+el profiling del init puede deadlockear, y (c) el config BK=64 del
+kernel KKT deadlockea por si mismo en V100. Los defaults parecen
+esquivarlo por la cache de autotune de triton. Reportable upstream
+junto a #488 (misma familia de kernels FLA/TileLang GDN con problemas
+de robustez en V100). RECOMENDACION OPERATIVA: no tocar los envs de
+autotune GDN en produccion; la via para acelerar el prefill del
+workaround #488 sigue siendo el fix upstream del kernel.
+
+Ademas: upstream #488/#478 sin respuestas de mantainers al cierre de
+esta ronda.
+
 Estado dense+MoE: QUASAR y HauhauCS son Qwen3.8 MoE - ambos sirven
 en nuestro stack (MoE por los kernels del wheel, envs
 VLLM_SM70_AWQ_MOE_* con defaults activos); densos validados en
