@@ -224,3 +224,21 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
 - Nota de metodo: git fetch de origin dio "unpack-objects fallo"
   parcial (objetos a medias) - verificar la integridad del fetch
   antes de construir desde un ref recien traido.
+
+## 2026-09-04e - Regresion 12.9 aislada por A/B de toolkit (upstream tip)
+
+- **La regresion de alloc del tip upstream es del TOOLKIT 12.9, no del
+  codigo**: mismo tip, misma carga (HauhauCS Q4_K_P en GPU vacia) -
+  con 12.9.86 falla (cudaMalloc OOM 16GB), con 12.8.93 CARGA Y
+  SIRVE (health OK, 17.7GB residentes). El nvcc/runtime 12.9 genera
+  algo que rompe la allocacion grande en sm_70. Reportable a
+  NVIDIA/llama.cpp con este A/B limpio (una variable: el toolkit).
+- **Rendimiento del tip**: 28.0 tok/s vs 40.0 de nuestro produccion
+  (866322481 + 12.9.2) en la misma GPU/prompt = 30% mas lento para el
+  HauhauCS. El fuse MoE no ayuda al GDN hybrid; el tip pierde decode
+  en este modelo. NO desplegar.
+- Veredicto final de la ronda driver/toolkit: produccion queda en
+  commits exactos de produccion + toolkit 12.9.2 (40 tok/s) - la
+  mejor config medida. Los toolkits 12.8/12.9 quedan instalados para
+  bisects futuros; builds preservados (build-toolkit128/129,
+  llama-wt-upstream/build-128 y /build-129).
