@@ -110,3 +110,40 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
   /tmp/opencode (scripts + result JSONs). Everything critical must live
   in git (tools/sm70_validation/) or Engram; results transcribed to docs
   immediately.
+
+## 2026-09-04 - Diagnostic and ops lessons (stall bisect, APC, flag audit)
+
+- **pkill -9 -f <pattern> KILLS THE CALLING SHELL** when the pattern
+  matches its own cmdline (silent command death). Use bracketed
+  patterns (`pkill -f "f24_[l]ongctx"`) or explicit PIDs.
+- **VLLM::EngineCore is the process NAME** of the spawned engine - it
+  does not match `grep python`. Find it via RSS or nvidia-smi
+  query-compute-apps. py-spy dump on THAT pid (sudo) is the definitive
+  stack; dumps on the parent only show queue.get.
+- **faulthandler.dump_traceback_later** is the right tool for vLLM
+  engine hangs when the engine runs in-process; in subprocess mode it
+  misleads (parent frames).
+- **A hung kernel can leave a zombie CUDA context** (31GB + 100% util,
+  owner in R state). kill -9 the engine frees it; gpu-reset as last
+  resort.
+- **setsid nohup ... < /dev/null &** for servers that must survive the
+  shell timeout (the timeout kills the process group otherwise).
+- **vllm serve from the venv runs the WHEEL** (no TRITON_PAGED): set
+  PYTHONPATH to the repo tree for our backend.
+- **--gdn-prefill-backend only reaches the resolver via CLI**: LLM()
+  kwargs are silently dropped (not in the signature).
+- **/srv/benchmarks is not writable by joker** - redirect window logs
+  to /tmp/opencode (a Permission-denied redirect kills the run
+  silently).
+- **sudo without cached credentials hangs** waiting for a password -
+  use sudo -n and re-authenticate when needed.
+- **Expanding the GDN autotune lists (KKT/DELTA_H BK/BV etc.) hangs
+  server init** (0% CPU/GPU after weight load): the reduced SM70
+  schedule is load-bearing until the autotune-in-profiling deadlock is
+  bisected.
+- **vLLM serves compile kernels lazily on first request** - send a
+  warmup request before measuring; the first request includes minutes
+  of JIT.
+- **Promotion A/B (2026-09-04)**: TRITON_PAGED BEATS FLASH_ATTN_V100
+  on Qwen3-1.7B eager: b1 1.16x, b8 1.11x, b16 1.09x, PPL parity 6e-5,
+  greedy 20/20. F1 promotion criterion exceeded (was: within 10%).

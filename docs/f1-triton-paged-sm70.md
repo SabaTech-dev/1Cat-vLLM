@@ -2,7 +2,7 @@
 
 Rama: `sprint/f1-triton-attn` (base: `contrib/restore-sm70-build`)
 Fecha: 2026-09-02
-Estado: esqueleto funcional + validación numérica en CPU (intérprete de Triton). Pendiente de ejecución en GPU.
+Estado: PROMOVIDO (2026-09-04). Paridad numérica + throughput que SUPERA a FLASH_ATTN_V100 (b1 1.16x, b8 1.11x, b16 1.09x en Qwen3-1.7B eager; PPL parity 6e-5; greedy 20/20). Backend de referencia del fork: sirve denso (0.6B/1.7B) y MoE (QUASAR NVFP4, HauhauCS AWQ-MTP) con KV int8+clip (ver PLAN_ADOPCIONES_FORK en la rama docs/adoption-plan-20260901 y SM70_FLAGS_REFERENCE.md).
 
 ## Objetivo
 
@@ -128,16 +128,18 @@ backends arrancaron junto a la carga productiva sin impacto.
 1. ~~**Prueba funcional end-to-end en V100**~~ (HECHA 2026-09-02: paridad greedy byte-identica vs FLASH_ATTN_V100 tras el fix de strides a327d45b7).
 2. ~~**CUDA Graphs**~~ (RESTABLECIDOS 202-09-03: decode-only, greedy 20/20 identico a eager, decode 3.4-4.2x mas rapido. La "corrupcion" original era un falso positivo de canario — ver seccion.)
 3. ~~**Autotuning**~~ (HECHO 2026-09-02: decode BN=128, prefill BM=16/BN=64; datos en f1-autotune.json). Queda opcional: partir el bucle KV en el bloque diagonal.
-4. **Rendimiento decode**: el kernel decode es 1 fila por programa; si
-   el batch pequeño deja la GPU ociosa, evaluar split-K (varios
-   programas por secuencia + reducción) como `TRITON_ATTN`.
+4. **Rendimiento decode**: CERRADO por medición (2026-09-04) - el A/B
+   vs FLASH_ATTN_V100 da 1.09-1.16x a favor de TRITON_PAGED sin
+   split-K; queda como opción futura si aparece un shape que pierda.
 5. **Quality gates A/B vs FLASH_ATTN_V100**: misma batería que el
    experimento SM70 previo (logprob/perplexity sobre corpus fijo,
    greedy match). Criterio de promoción: paridad numérica < 1e-2 y
    throughput decode dentro del 10 % de FA-V100 antes de considerar el
    backend para nada más que experimentación.
-6. **fp8 KV cache** (dequant en kernel) y sliding window si el caso de
-   uso lo pide.
+6. **fp8 KV cache**: SUPERSEDIDO por el camino int8/int4 per-(token,head)
+   con escalas inline y calibración de clip (F2) - superior en V100
+   (fp8 sin compute nativo, y el esquema PTH corrige outliers por
+   fila). Sliding window: sin caso de uso activo.
 7. **Ampliar la gate de CC** a Turing/Ampere una vez validado en
    hardware (los kernels no contienen nada específico de SM70).
 
