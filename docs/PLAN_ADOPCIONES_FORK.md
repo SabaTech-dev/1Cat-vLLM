@@ -468,6 +468,24 @@ mueren con el grupo al agotar el timeout (usar setsid nohup); la CLI
 vllm serve del venv usa el wheel (necesita PYTHONPATH al repo para
 nuestro backend TRITON_PAGED). Produccion :8009/:8001 OK.
 
+#### F2.4 CERRADO (2026-09-04): decode plano a contexto largo
+
+Medicion en QUASAR NVFP4 TP1 eager, TRITON_PAGED + int8+clip KV +
+backend GDN triton (vllm serve + cliente streaming con timestamps por
+chunk, prompt de 32,760 tokens del corpus):
+- Prefill: 1,000.6 s (~32.7 tok/s) con el backend alternativo
+- Decode a 32K de contexto: 5.3 tok/s (128 tokens en 24.0 s)
+- Referencia a 4K (bateria eager): 5.5 tok/s
+-> El decode es PLANO con el contexto: la atencion paginada no degrada
+   a contexto largo; el costo esta concentrado en el prefill del
+   kernel GDN alternativo (el fix upstream del FlashQLA TileLang lo
+   restauraria; ver #488).
+
+F2 queda CERRADO: watermark + LIFO + int8+clip (+48% capacidad) +
+matriz de dtypes + decode plano a 32K. Pendiente del roadmap: F8
+(bench triton 3.5.1 vs 3.6.0) como siguiente item de optimizacion;
+F4 re-scoped (esperar evidencia upstream).
+
 Hallazgos transferibles documentados en #441/humanjesse:
 - Spec-decode en V100 es net-negativo hoy (flash_attn_v100 no sostiene
   graphs bajo spec → PIECEWISE ~46 tok/s; triton_attn ~77 vs ~100
