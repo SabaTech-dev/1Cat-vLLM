@@ -421,6 +421,34 @@ extendido), #214 (fused layernorm false-positive MTP). #334 respondida
 con nuestra receta validada (env TURBOMIND + eager + memory tuning +
 clip).
 
+#### Diagnostico del stall, sesion 2 (2026-09-04): sospechoso principal
+
+py-spy al EngineCore (el proceso se llama VLLM::EngineCore - los greps
+de python no lo encuentran). Tres estados capturados en corridas 32K:
+1. Forward activo moviendose por capas GDN (qwen3_next rms_norm) -
+   el prefill AVANZA durante ~10+ min (lento, no colgado).
+2. Cuelgue REAL confirmado dos veces: thread clavado en
+   sm70_trace_event_sync (sm70_decode_trace.py:83) ->
+   event.synchronize() del async_copy_ready_event que NUNCA dispara =
+   un kernel del forward no termino (GPU 100% sin progreso).
+3. Triton JIT compilando (_init_handles) - minutos extra por corrida.
+
+Exonerado: el camino de muestreo top1 fundido (el stack previo era del
+proceso PADRE, enganoso). Sospechoso principal: kernel FlashQLA-SM70
+TileLang del GDN prefill (qwen_gdn_linear_attn.py:373 "original
+FlashQLA-SM70 TileLang GDN prefill path") a contexto largo.
+
+Pendiente definitivo: forzar --gdn-prefill-backend triton (el kwarg
+gdn_prefill_backend y additional_config via LLM() NO llegaron al
+resolver - "requested=auto" en ambos intentos; probar EngineArgs
+directo o CLI serve). Si el backend triton completa 32K/55K, el fix
+para la metodologia 262K es el cambio de backend GDN + reporte
+upstream del kernel FlashQLA TileLang.
+
+Leccion operacional critica: pkill -9 -f <patron> MATA EL SHELL PROPIO
+si el patron aparece en su cmdline - explica fallos silenciosos
+previos. Usar [c]orchetes o PID explicito.
+
 Hallazgos transferibles documentados en #441/humanjesse:
 - Spec-decode en V100 es net-negativo hoy (flash_attn_v100 no sostiene
   graphs bajo spec → PIECEWISE ~46 tok/s; triton_attn ~77 vs ~100
