@@ -556,6 +556,16 @@ workaround #488 sigue siendo el fix upstream del kernel.
 Ademas: upstream #488/#478 sin respuestas de mantainers al cierre de
 esta ronda.
 
+REFINAMIENTO (sonda aislada): el kernel KKT con BK=64 aislado (configs
+parcheadas a una sola, tensores sinteticos) PASA perfecto e identico a
+BK=32. El deadlock NO es del kernel: es la INTERACCION triton-autotune
+benchmarking x vLLM init-profiling (cache miss -> benchmarking con
+eventos dentro del profiling -> bloqueo). Comentado y corregido en
+#488. Esto lo hace FIXABLE en el fork: pre-warm del autotune FLA antes
+del profiling pass (o schedules single-config). Estimacion de fix
+fork-side: 2-4h + gates. El hang >16K de FlashQLA TileLang sigue
+siendo un bug de kernel separado y genuino.
+
 Estado dense+MoE: QUASAR y HauhauCS son Qwen3.8 MoE - ambos sirven
 en nuestro stack (MoE por los kernels del wheel, envs
 VLLM_SM70_AWQ_MOE_* con defaults activos); densos validados en
