@@ -147,3 +147,34 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
 - **Promotion A/B (2026-09-04)**: TRITON_PAGED BEATS FLASH_ATTN_V100
   on Qwen3-1.7B eager: b1 1.16x, b8 1.11x, b16 1.09x, PPL parity 6e-5,
   greedy 20/20. F1 promotion criterion exceeded (was: within 10%).
+
+## 2026-09-04b - Xid 31 autoinfligido y lecciones de recursos externos
+
+- **Xid 31 (GPU memory page fault) fue causado por nuestras pruebas de
+  autotune GDN** (pid del EngineCore, timestamp exacto 15:46:48 = el
+  warmup skipped: illegal memory access). Un IMA de kernel genera Xid
+  31; el contexto muere y el driver lo reporta. La GPU se recupero
+  (produccion OK tras la ventana). REGLA DURA: no repetir experimentos
+  que induzcan IMA en este hardware (tarjeta con historial RMA/Xid) -
+  el hallazgo ya esta reportado upstream (#488); no aporta nada
+  reproducirlo localmente.
+- **Determinismo de prefill (patron DocAI)**: mismo prompt x10,
+  temperature=0, max_tokens=1, top_logprobs=20, comparacion bit de la
+  lista top-20. Mas sensible y barato que una suite: detecta kernels
+  no deterministas aunque la salida parezca estable. Herramienta:
+  `f2_determinism_probe.py`. Ejecutar antes de aceptar cualquier
+  receta de serving nueva.
+- **Divergencia bajo greedy SIEMPRE es bug de stack** (no varianza
+  natural): controla con un segundo engine (llama.cpp) antes de culpar
+  al modelo.
+- **Determinismo expone**: el greedy+thinking loop de Qwen (fin de
+  thinking repetido, respuesta vacia, finish=length) y la no-
+  equivalencia MTP-vs-greedy eran fallos enmascarados por el ruido del
+  kernel no determinista. Aplica a nuestro serving de HauhauCS
+  (thinking mode): vigilar loops de thinking; retry con T>0 o
+  presence_penalty como mitigacion.
+- **Bug MoE FP16 de upstream vLLM (BLOCK_SIZE_K=128 en decode M<=64 ->
+  register-spill en V100, 4-9x)**: nuestro fork YA esta protegido -
+  1Cat tiene el fix equivalente default-on
+  (VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG=True, BK=64/32). Validado en
+  el arbol; sin accion adicional. Referencia: v100-vllm-2026 ch.2.
