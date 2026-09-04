@@ -202,3 +202,25 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
   4) desactivar custom all-reduce en 1Cat-vLLM; 5) comparar R580 vs
   R570 manteniendo intacto el userspace cu128; 6) revisar Xid y
   segfaults en journalctl -k y dmesg.
+
+## 2026-09-04d - Revision upstream/unsloth llama.cpp: no desplegable
+
+- **Upstream tip (1863ac033, 0.4.0-dev, 137 commits por delante)**:
+  contiene piezas interesantes (3466812d1 fuse MoE weighted expert
+  reduction - relevante para Ornith A3B; e4b9af007 XOR swizzle FA) y
+  12.9.2 compila sm_70 sin problema. PERO tiene una REGRESION
+  bloqueante en V100: la carga del HauhauCS Q4_K_P (16.6 GiB) falla
+  con `cudaMalloc failed: out of memory` en una GPU VACIA de 32GB,
+  incluso con ctx 8192 y CUDA_VISIBLE_DEVICES explicito. No
+  desplegable. Candidato a reporte upstream con el repro (worktree
+  llama-wt-upstream + build-129 conservados).
+- **Unsloth fork (261 commits)**: trabajo unico centrado en carries
+  qwen4exp/Flash-Next (nextn draft head), GGML_CUDA_ENABLE_UNIFIED_
+  MEMORY pin e higiene de CI (-Werror). NADA para nuestros modelos
+  (Qwen3.8-27B GDN hybrid y Ornith A3B corren en mainline). SKIP.
+- **Nuestro despliegue 12.9.2 (commits exactos de produccion) queda
+  como mejor estado**: paridad/mejora medida, librerias cuBLASLt
+  corregidas, rollbacks listos (.bak-129).
+- Nota de metodo: git fetch de origin dio "unpack-objects fallo"
+  parcial (objetos a medias) - verificar la integridad del fetch
+  antes de construir desde un ref recien traido.
