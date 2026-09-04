@@ -2569,6 +2569,59 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+        self._sm70_autotune_warmup()
+
+    def _sm70_autotune_warmup(self) -> None:
+        """Pre-warm the FLA chunked GDN autotune selections before the
+        engine profiling dummy run.
+
+        Triton autotune benchmarking inside the vLLM profiling pass can
+        deadlock (blocked sync at 0% CPU/GPU) whenever the SM70 config
+        lists are overridden and the cached selection no longer applies.
+        Running the chunked op once here with synthetic tensors performs
+        the benchmarking in a plain context, so the profiling pass hits
+        the cached selection. Opt-in via VLLM_SM70_GDN_AUTOTUNE_WARMUP=1;
+        failures are logged and never fatal.
+        """
+        if not envs.VLLM_SM70_GDN_AUTOTUNE_WARMUP:
+            return
+        if not (
+            current_platform.is_cuda()
+            and current_platform.get_device_capability() == (7, 0)
+        ):
+            return
+        try:
+            device = torch.device(torch.cuda.current_device())
+            b, t = 1, FLA_CHUNK_SIZE
+            hk, hv = self.num_k_heads, self.num_v_heads
+            kdim, vdim = self.head_k_dim, self.head_v_dim
+            q = torch.randn(b, t, hk, kdim, device=device, dtype=torch.float16)
+            k = torch.randn(b, t, hk, kdim, device=device, dtype=torch.float16)
+            v = torch.randn(b, t, hv, vdim, device=device, dtype=torch.float16)
+            g = torch.randn(b, t, hk, device=device, dtype=torch.float32)
+            beta = torch.rand(b, t, hk, device=device, dtype=torch.float32)
+            cu_seqlens = torch.tensor([0, t], device=device, dtype=torch.int32)
+            chunk_indices = torch.tensor([[0, 0]], device=device, dtype=torch.int32)
+            fla_chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                use_qk_l2norm_in_kernel=True,
+            )
+            torch.cuda.synchronize()
+            logger.info_once(
+                "SM70 GDN autotune warmup done (hk=%d hv=%d k=%d v=%d).",
+                hk,
+                hv,
+                kdim,
+                vdim,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning_once("SM70 GDN autotune warmup skipped: %s", e)
 
     def create_qkvz_proj(
         self,

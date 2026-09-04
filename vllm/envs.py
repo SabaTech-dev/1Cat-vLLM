@@ -515,6 +515,7 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_KKT_BK: str | None = None
     VLLM_SM70_GDN_KKT_WARPS: str | None = None
     VLLM_SM70_GDN_KKT_STAGES: str | None = None
+    VLLM_SM70_GDN_AUTOTUNE_WARMUP: bool = False
     VLLM_SM70_GDN_DELTA_H_SCHEDULE: bool = True
     VLLM_SM70_GDN_DELTA_H_BV: str | None = None
     VLLM_SM70_GDN_DELTA_H_WARPS: str | None = None
@@ -3132,6 +3133,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_GDN_KKT_BK": lambda: os.getenv("VLLM_SM70_GDN_KKT_BK"),
     "VLLM_SM70_GDN_KKT_WARPS": lambda: os.getenv("VLLM_SM70_GDN_KKT_WARPS"),
     "VLLM_SM70_GDN_KKT_STAGES": lambda: os.getenv("VLLM_SM70_GDN_KKT_STAGES"),
+    # Warm the FLA GDN autotune selections with synthetic tensors at layer
+    # construction, before the engine profiling dummy run. Avoids the
+    # init deadlock that triton autotune benchmarking can hit inside the
+    # profiling pass when the config lists are overridden.
+    "VLLM_SM70_GDN_AUTOTUNE_WARMUP": lambda: bool(
+        int(os.getenv("VLLM_SM70_GDN_AUTOTUNE_WARMUP", "0"))
+    ),
     # Experimental SM70 GDN/FLA delta-state autotune search-space gate.
     "VLLM_SM70_GDN_DELTA_H_SCHEDULE": lambda: bool(
         int(os.getenv("VLLM_SM70_GDN_DELTA_H_SCHEDULE", "1"))
