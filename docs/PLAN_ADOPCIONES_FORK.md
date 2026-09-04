@@ -502,6 +502,32 @@ con confirmacion upstream (#478); upstream pendiente: #488 (kernel
 FlashQLA GDN prefill >16K). Siguiente fase: optimizacion pura sobre
 la base estable.
 
+#### Optimizacion: APC validado (2026-09-04, inspirado en tiny-vllm-extend)
+
+Revision de recursos externos (tiny-vllm, tiny-vllm-extend, yalm):
+- yalm (andrewkchan): gotcha de atomicAdd con subnormales flush-to-
+  zero -> NO aplica (cero tl.atomic en nuestros kernels, verificado).
+- tiny-vllm-extend: el valor del prefix caching en workloads de
+  prefijo comun -> experimento ejecutado sobre NUESTRO stack.
+- tiny-vllm (jmaczan): material educativo, sin integracion directa.
+
+RESULTADO APC (QUASAR NVFP4, TRITON_PAGED + int8+clip + GDN triton,
+--enable-prefix-caching, prompt identico de 8,193 tokens x2):
+- 1a request (prefill completo): 92.6 s (~88.5 tok/s prefill a 8K)
+- 2a request (cache hit): 10.5 s -> TTFT 8.8x mas rapido
+- Salidas identicas (greedy) en ambas.
+
+VEREDICTO: APC compatible con nuestro backend; habilitarlo en
+produccion vLLM para workloads con system prompts compartidos
+(por ejemplo el trafico de LHU contra :8010). Costo: memoria extra
+de bloques cacheados (contabilizada por el watermark existente).
+Recomendacion activa: --enable-prefix-caching en el despliegue.
+
+Estado dense+MoE: QUASAR y HauhauCS son Qwen3.8 MoE - ambos sirven
+en nuestro stack (MoE por los kernels del wheel, envs
+VLLM_SM70_AWQ_MOE_* con defaults activos); densos validados en
+1.7B/0.6B. Inference cubierta para ambas familias.
+
 Hallazgos transferibles documentados en #441/humanjesse:
 - Spec-decode en V100 es net-negativo hoy (flash_attn_v100 no sostiene
   graphs bajo spec → PIECEWISE ~46 tok/s; triton_attn ~77 vs ~100
