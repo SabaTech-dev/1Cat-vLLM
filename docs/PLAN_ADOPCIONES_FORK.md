@@ -566,6 +566,23 @@ del profiling pass (o schedules single-config). Estimacion de fix
 fork-side: 2-4h + gates. El hang >16K de FlashQLA TileLang sigue
 siendo un bug de kernel separado y genuino.
 
+#### Pre-warm implementado + IMA como causa raiz (2026-09-04, ronda final)
+
+Implementado el hook VLLM_SM70_GDN_AUTOTUNE_WARMUP (commit 57c568a11):
+ejecuta el op chunked GDN una vez con tensores sinteticos varlen en la
+construccion de la capa, ANTES del profiling del init. Resultado de los
+gates E2E: convierte el "hang" en un error capturable y expuso la causa
+raiz REAL - cudaErrorIllegalAddress. Los configs fuera del schedule
+SM70 reducido (KKT_BK=64, DELTA_H_BV!=16, varias combinaciones de
+warps/stages) generan IMA en V100; el default solo se salva porque la
+cache de autotune salta el benchmarking. El "deadlock" era el contexto
+CUDA envenenado por el IMA bloqueando el sync del profiling (0% CPU/
+GPU). Publicado en #488 (comentario 5543081279) con la guia para
+usuarios SM70: NO expandir las listas de autotune GDN hasta fix
+upstream de los kernels fla. La via de acelerar el prefill queda en
+manos upstream (los kernels necesitan correccion de direccionamiento
+por config).
+
 Estado dense+MoE: QUASAR y HauhauCS son Qwen3.8 MoE - ambos sirven
 en nuestro stack (MoE por los kernels del wheel, envs
 VLLM_SM70_AWQ_MOE_* con defaults activos); densos validados en
