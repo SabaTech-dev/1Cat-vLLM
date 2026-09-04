@@ -178,3 +178,27 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
   1Cat tiene el fix equivalente default-on
   (VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG=True, BK=64/32). Validado en
   el arbol; sin accion adicional. Referencia: v100-vllm-2026 ch.2.
+
+## 2026-09-04c - Toolkit A/B (llama.cpp/QFlash en Volta) y protocolo multi-GPU
+
+- **Toolkit A/B en llama.cpp (fuente 43991d229, Qwen3.8-27B Q4_K_P,
+  -ngl 99, GPU 1, pp512+tg128)**: CUDA 12.0.140 vs 12.8.93 vs
+  12.9.86 - los tres estadisticamente identicos (tg128
+  33.39/33.34/33.34; pp512 647/643/639 +-ruido). El toolkit NO cambia
+  la velocidad en Volta para este motor; elige por CORRECCION (12.9.x
+  trae fixes criticos de cuBLASLtMatmul: resultados incorrectos
+  concurrentes con kernels tensor-core, IMA con leading dimensions
+  grandes) o por features de build (compresion binaria GGUF exige
+  12.8+). Builds preservados: build-toolkit{120,128,129}.
+- **Leccion de medicion**: sin CUDA_VISIBLE_DEVICES, llama-bench corre
+  en GPU 0 (llama-main ocupada) y el fallo VMM del pool se ve como
+  crash - siempre fijar la GPU en los benches.
+- **Protocolo de diagnostico multi-GPU (2a V100)** - NO atribuir
+  fallos automaticamente a R580. 1Cat tiene evidencia de un incidente
+  en R580.159.03 y una ruta de custom all-reduce problematica en SM70
+  que se estabiliza con --disable-custom-all-reduce. Orden correcto:
+  1) probar cada GPU por separado; 2) p2pBandwidthLatencyTest +
+  nccl-tests; 3) verificar nvidia-smi topo -m y afinidad NUMA;
+  4) desactivar custom all-reduce en 1Cat-vLLM; 5) comparar R580 vs
+  R570 manteniendo intacto el userspace cu128; 6) revisar Xid y
+  segfaults en journalctl -k y dmesg.
