@@ -486,6 +486,22 @@ matriz de dtypes + decode plano a 32K. Pendiente del roadmap: F8
 (bench triton 3.5.1 vs 3.6.0) como siguiente item de optimizacion;
 F4 re-scoped (esperar evidencia upstream).
 
+#### F8 CERRADO (2026-09-04): TRITON_PAGED insensible a la version de triton
+
+A/B en Qwen3-1.7B (TRITON_PAGED, fp16, eager, misma GPU/sesion):
+triton 3.5.1 vs 3.6.0 -> PPL identico (4.7426), greedy 20/20,
+throughput dentro de ruido (b1 0.96x, b8 1.01x, b16 0.98x).
+El retardo 3x documentado por humanjesse afecta a los kernels MLA,
+no a nuestro backend. VEREDICTO: no pinear 3.5.1; mantener 3.6.0.
+Herramienta preservada: /srv/benchmarks/1cat/venv-triton351 (clon del
+venv con triton 3.5.1 --no-deps; pip show muestra stale 3.6.0 pero
+import triton da 3.5.1).
+
+ROADMAP COMPLETO: F1-F2 (+F2.4), F8, F9.1 entregados; F4 re-scoped
+con confirmacion upstream (#478); upstream pendiente: #488 (kernel
+FlashQLA GDN prefill >16K). Siguiente fase: optimizacion pura sobre
+la base estable.
+
 Hallazgos transferibles documentados en #441/humanjesse:
 - Spec-decode en V100 es net-negativo hoy (flash_attn_v100 no sostiene
   graphs bajo spec → PIECEWISE ~46 tok/s; triton_attn ~77 vs ~100
