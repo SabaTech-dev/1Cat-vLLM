@@ -242,3 +242,25 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
   mejor config medida. Los toolkits 12.8/12.9 quedan instalados para
   bisects futuros; builds preservados (build-toolkit128/129,
   llama-wt-upstream/build-128 y /build-129).
+
+## 2026-09-04g - Reporte regresion toolkit 12.9 + repro #490 (no reproduce)
+
+- **llama.cpp #28416 creado**: regresion sm_70 toolkit 12.9.x (cudaMalloc
+  OOM en GPU vacia) aislada por A/B con 12.8.x. Repro preservado
+  (llama-wt-upstream/build-{128,129}).
+- **#490 (TP2 >221K decode collapse) NO REPRODUCE en nuestro build**
+  dev-line (ef68a0ea + sprint): 2x240K tokens concurrentes, config
+  identica (TP2, FLASH_ATTN_V100, fp8_e5m2 KV, 262K, seqs 3, util
+  0.92, prefix cache + Mamba align) -> 12.8 tok/s agregado, sano.
+  Con NCCL_P2P_DISABLE=1 tambien sano (12.6 tok/s) -> P2P no es el
+  gatillo. Diferencia restante: wheel 1.5.0 del reporter vs dev-line,
+  o hardware PCIe fisico. Comentario publicado con el datapoint.
+- Sonda deterministica de corpus largo: prompt de 240K tokens
+  generado con tokenizer propio + shuffle sembrado (tools promocionados).
+- Gotchas del round: (1) pkill -f con patron en el propio cmdline se
+  suicida aunque uses corchetes si el patron esta en el string del
+  bash -c (usar pgrep con [x] Y evitar el literal en el mismo
+  comando); (2) curls en background con & mueren con el shell del
+  bash tool al timeout - usar setsid bash -c '...' < /dev/null &
+  disown; (3) el prompt de 1.16MB no cabe como argumento de curl -
+  usar --data-binary @file.
