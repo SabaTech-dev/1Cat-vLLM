@@ -523,6 +523,17 @@ produccion vLLM para workloads con system prompts compartidos
 de bloques cacheados (contabilizada por el watermark existente).
 Recomendacion activa: --enable-prefix-caching en el despliegue.
 
+#### Auditoria documental (2026-09-04): A/B de promocion F1 registrado
+
+Contraste docs-vs-pruebas: el criterio de promocion de F1 (item 5,
+"throughput dentro del 10% de FA-V100") no tenia medicion registrada.
+Ejecutado (Qwen3-1.7B, eager, triton 3.6.0): TRITON_PAGED SUPERA a
+FLASH_ATTN_V100 - b1 1.16x (23.2 vs 19.9), b8 1.11x (170.9 vs 153.5),
+b16 1.09x (341.1 vs 313.2), PPL parity 6e-5, greedy 20/20. Registrado
+en docs/f1-triton-paged-sm70.md (items 4-6 cerrados: split-K
+innecesario, fp8 superseded por int8 PTH) y LESSONS.md sincronizada
+con las 12 lecciones 09-04.
+
 Estado dense+MoE: QUASAR y HauhauCS son Qwen3.8 MoE - ambos sirven
 en nuestro stack (MoE por los kernels del wheel, envs
 VLLM_SM70_AWQ_MOE_* con defaults activos); densos validados en
