@@ -449,6 +449,25 @@ Leccion operacional critica: pkill -9 -f <patron> MATA EL SHELL PROPIO
 si el patron aparece en su cmdline - explica fallos silenciosos
 previos. Usar [c]orchetes o PID explicito.
 
+#### ROOT CAUSE CONFIRMADO (2026-09-04, issue #488)
+
+El kernel FlashQLA-SM70 (TileLang) del GDN prefill SE CUELGA a partir
+de ~16K tokens de prompt; el backend Triton/FLA alterna COMPLETA:
+32,760 tokens de prefill + 32 decode en 18m56s con salida coherente y
+correcta via vllm serve --gdn-prefill-backend triton. Issue upstream
+publicada (#488) con repro, stacks py-spy y workaround. El override
+via CLI funciona (el kwarg LLM() se descarta en silencio; para offline
+hay que usar el server o EngineArgs -> create_engine_config).
+
+Consecuencia para la metodologia 262K: DESBLOQUEADA tecnicamente
+(backend triton, prefill ~29 tok/s en TP1 - lento pero correcto);
+el fix upstream del kernel FlashQLA restauraria la velocidad.
+
+Notas operacionales de la ventana: los procesos hijos de un tool-call
+mueren con el grupo al agotar el timeout (usar setsid nohup); la CLI
+vllm serve del venv usa el wheel (necesita PYTHONPATH al repo para
+nuestro backend TRITON_PAGED). Produccion :8009/:8001 OK.
+
 Hallazgos transferibles documentados en #441/humanjesse:
 - Spec-decode en V100 es net-negativo hoy (flash_attn_v100 no sostiene
   graphs bajo spec → PIECEWISE ~46 tok/s; triton_attn ~77 vs ~100
