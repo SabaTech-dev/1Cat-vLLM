@@ -583,6 +583,35 @@ upstream de los kernels fla. La via de acelerar el prefill queda en
 manos upstream (los kernels necesitan correccion de direccionamiento
 por config).
 
+#### Recursos externos integrados + Xid 31 (2026-09-04b)
+
+Xid 31 (page fault GPU 1, 15:46:48): AUTOINFLIGIDO por nuestra sonda
+de autotune GDN (pid y timestamp coinciden con el warmup skipped IMA).
+GPU recuperada; REGLA: no repetir experimentos IMA en este hardware
+(historial RMA). Documentado en LESSONS.
+
+Integrado desde recursos externos:
+1. Sonda de determinismo de prefill (patron DocAI):
+   tools/sm70_validation/f2_determinism_probe.py - mismo prompt x10,
+   top_logprobs=20, comparacion bit. Ejecutar antes de aceptar
+   cualquier receta de serving nueva. Bajo greedy, divergencia = bug
+   de stack, nunca varianza natural.
+2. Notas operativas para produccion (HauhauCS thinking mode): el loop
+   greedy+thinking (thinking repetido, respuesta vacia, finish=length)
+   es un fallo de configuracion known-issue de Qwen; mitigar con
+   T>0/presence_penalty/retry. Y MTP NO es output-equivalente a greedy
+   en esta familia - refuerza el re-scope de F4.
+3. Bug MoE FP16 upstream (BLOCK_SIZE_K=128 en decode M<=64 ->
+   register-spill en V100, 4-9x; v100-vllm-2026 ch.2): NUESTRO FORK YA
+   PROTEGIDO - 1Cat tiene el fix equivalente default-on
+   (VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG=True, BK=64/32). Validado
+   en el arbol.
+4. Plugin fp8-w8a16-sm70 (vllm-fp8-w8a16-sm70): kernels W8A16 custom
+   SM70 (pesos fp8/int8, activaciones fp16) que hacen MoEs grandes
+   factibles y decodifican mas rapido que FP16. CANDIDATO DE ROADMAP
+   para Qwen4-Exp/MoE (evaluar integracion de ideas; no bloqueante -
+   nuestro AWQ WNA16 + NVFP4 ya cubren quantized serving).
+
 Estado dense+MoE: QUASAR y HauhauCS son Qwen3.8 MoE - ambos sirven
 en nuestro stack (MoE por los kernels del wheel, envs
 VLLM_SM70_AWQ_MOE_* con defaults activos); densos validados en
