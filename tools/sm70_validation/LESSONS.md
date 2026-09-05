@@ -264,3 +264,23 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
   bash tool al timeout - usar setsid bash -c '...' < /dev/null &
   disown; (3) el prompt de 1.16MB no cabe como argumento de curl -
   usar --data-binary @file.
+
+## 2026-09-05 - F3 async scheduling evaluado: NO adoptar
+
+- **TP2 (objetivo del sprint): async scheduling = CERO ganancia
+  medible** (ITL 22ms/24ms, TTFT 1.63/1.65s, agg 111.1 vs 111.4
+  tok/s - identico a sync). La hipotesis de la burbuja scheduler-CPU
+  en TP2 queda REFUTADA en nuestro stack: el paso GPU domina y el
+  pipeline del fork ya solapa lo solapable.
+- **TP1: async mejora ITL solitario (-13%, 33 vs 38ms) pero PENALIZA
+  concurrencia (+10% ITL x4, agg -9.5%)** - net negativo para serving.
+- Bench: QUASAR NVFP4, prompts 2K x 256 tok greedy, streaming client
+  (TTFT/ITL p50/p99), x1/x4, sync vs --async-scheduling, TP1 y TP2.
+- **Determinismo**: greedy diverge en whitespace (2/96 tokens) sync vs
+  async - benigno (chunked-prefill segmenta distinto -> acumulacion
+  fp16 distinta en ties). Contenido identico.
+- **Decision: NO activar --async-scheduling en produccion.** F3
+  cerrado como evaluado-no-adoptado. Lever propio del fork:
+  VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH (default 0) queda sin uso.
+- TP2 NVLink dobla el decode de TP1 (ITL 22 vs 38ms solitario) -
+  dato util para sizing.
