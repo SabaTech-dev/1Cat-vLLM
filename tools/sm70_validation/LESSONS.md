@@ -284,3 +284,29 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
   VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH (default 0) queda sin uso.
 - TP2 NVLink dobla el decode de TP1 (ITL 22 vs 38ms solitario) -
   dato util para sizing.
+
+## 2026-09-05b - Bench estrella TP2 32K: TRITON_PAGED stall, FA_V100+fp8 serve
+
+- **TRITON_PAGED DEADLOCK en serving concurrente** del 27B GDN TP2:
+  x4 con 4K prompts, GPUs al 0%, Running 3-4/throughput 0 - con int8
+  PTH Y con fp16 KV (no es el dtype: es el backend). Request UNICO
+  funciona (smoke 32K OK, 56 tok/s prefill lento). La promocion F1 se
+  valido con baterias offline LLM() sobre Qwen3-0.6B denso - nunca en
+  serving streaming concurrente del 27B. Bug candidado a reportar.
+- **FA_V100 + fp8_e5m2 + APC = la receta de serving TP2 que SI
+  funciona** (262K ctx, 2xV100): cold x4 32K: wall 153s, TTFT p50
+  101s (prefill-dominated 128K); warm x8 (4+4 cache): 98.6 tok/s agg,
+  17.4 tok/s/stream, ITL 68ms; APC shared x4: 88.1 tok/s agg,
+  40 tok/s/stream, ITL 30ms, TTFT 5.2s.
+- **VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16 = efecto CERO en TP2
+  serving** (B vs C identicos). El +7% b16 era de 0.6B offline - no
+  generaliza. Fuera de la receta.
+- KV capacity TP2 QUASAR: fp8 1,093,773 tok / int8 PTH 1,044,082 /
+  (fp16 ~550K) -> conc 4.13x a 262K len.
+- Alfred-monitor: su health-check hace systemctl start de los 5
+  servicios cuando estan down (joker@openclaw-workspace) - las
+  ventanas largas deben avisarle o asumir crash-loop inofensivo
+  (no puede asignar mientras vLLM sostiene la GPU).
+- pkill -f se suicida si el PATRON literal aparece en CUALQUIER parte
+  del comando (incluido el contenido de un printf/heredoc en el mismo
+  bash -c). Kill SIEMPRE en comando separado.
