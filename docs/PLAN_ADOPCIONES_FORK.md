@@ -192,12 +192,17 @@ docs/f1-triton-paged-sm70.md): greedy 20/20 identico, decode 3.4-4.2x.
 
 ## Sprint F3 — Async scheduling
 
-**Objetivo**: solapar el scheduler CPU con el paso GPU (patrón V1) — ataque directo a la burbuja
-de latencia TP2, sin dependencia de SM.
-
-1. Habilitar/probar async scheduling del upstream sobre nuestra base (o backport mínimo).
-2. Bench de latencia: TTFT p50/p99 y ITL bajo concurrencia, ×1/×4.
-3. Doc: flags de scheduler recomendados para TP2 SM70 (con levers de recipes).
+**ESTADO (2026-09-05): COMPLETADO — evaluado, NO adoptado.**
+El flag existe en el árbol (`--async-scheduling`, uniproc+multiproc; lever propio
+`VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH`). Bench A/B con QUASAR NVFP4 (prompts 2K×256 greedy,
+streaming, ×1/×4, TP1 y TP2):
+- **TP2 (objetivo del sprint): cero ganancia** — ITL/TTFT/throughput idénticos a sync
+  (ITL 22-24ms, agg 111 tok/s). La burbuja scheduler-CPU hipotetizada no existe en nuestro
+  stack TP2: el paso GPU domina.
+- **TP1: mejora solitario (ITL -13%) pero penaliza concurrencia** (×4: ITL +10%, agg -9.5%).
+- Greedy diverge solo en whitespace (chunked-prefill segmenta distinto) — benigno.
+**Decisión**: no activar en producción. Dato útil de sizing: TP2 NVLink dobla el decode de
+TP1 (ITL 22 vs 38ms solitario).
 
 ## Sprint F4 — Speculative decoding: EAGLE3-Qwen3 + prefix caching barato
 
