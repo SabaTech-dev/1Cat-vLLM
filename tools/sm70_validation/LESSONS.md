@@ -310,3 +310,30 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
 - pkill -f se suicida si el PATRON literal aparece en CUALQUIER parte
   del comando (incluido el contenido de un printf/heredoc en el mismo
   bash -c). Kill SIEMPRE en comando separado.
+
+## 2026-09-06 - #490 reproducido con prompts DISTINTOS; leccion harness
+
+- **El colapso #490 SI reproduce en nuestro sprint** (gef68a0ea+sprint,
+  SXM2 NVLink, custom-AR off): 2 prompts DISTINTOS ~239K concurrentes
+  -> 0.2-0.3 tok/s sostenido 8 min (24 ventanas de log), KV creep
+  ~90K, hit 0.0%. Mi "no reproduce" anterior fue un artefacto de
+  prompts IDENTICOS (cache hit enmascara el solape prefill+decode).
+  Corregido en publico (#490 comentario 5562125911).
+- Mecanismo (areslp): batch MIXTO prefill+decode no toma la ruta
+  rapida XQA (q_len==1 puro) -> decode recalculado sobre contexto
+  completo. Mismo familiares que #505 (TRITON_PAGED stall en batch
+  mixto) -> problema arriba del backend de atencion (capa scheduler/
+  composicion de batch). Workaround comunitario: --max-num-seqs 1.
+- **Regla de harness: NUNCA usar prompts identicos para tests de
+  concurrencia** - el cache hit invalida el arm. Distinct por defecto;
+  identical solo como arm explicito de cache.
+- Repos comunitarios/officiales SIEMPRE antes de benchcar: el runbook
+  Redhatvale ya mapeaba (custom-AR off PCIe, max-num-seqs 1,
+  VLLM_SKINNY_DROP_CT IMA en TP2, TP1 NVFP4 no cabe 32GB).
+- llama.cpp #28416: WARNING por politica anti-IA (JohannesGaessler).
+  NO escribir mas en repos ggml con esta cuenta sin texto humano.
+  El bisect pedido (commit x toolkit) seria caro; dejar el A/B como
+  evidencia.
+- Stack comunitario alternativo a contrastar: v100-skinny (kernels
+  NVFP4 W4A16 hand-written) 61-74 tok/s PCIe / 95-118 SXM2 con MTP
+  k=7 vs nuestro TurboMind compressed-tensors.
