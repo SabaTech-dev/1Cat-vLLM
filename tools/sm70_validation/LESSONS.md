@@ -448,3 +448,23 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
 - Descarga en /home/joker/v100-qwen38/lyf-vl (persistente). Con esto,
   la Opcion 1 (vLLM estrella TP2) ya tiene TODAS las capacidades de
   la produccion actual salvo... nada: texto+vision+MTP+APC+131K.
+
+## 2026-09-07g - A/B MTP k=3 vs k=7 con flags oficiales de receta
+
+- Flags oficiales de recipes.vllm.ai integrados a la receta estrella:
+  --reasoning-parser qwen3 (el template abre <think>; sin parser el
+  reasoning contamina content), --enable-auto-tool-choice
+  --tool-call-parser qwen3_coder, --enable-prefix-caching explicito.
+- **Acceptance real con texto natural (metricas spec_decode)**:
+  k=3 = **79.4%** (en el rango 0.75-0.9 de la receta); k=7 = 60.0%.
+  El acceptance agregado cae con la profundidad del draft (las
+  posiciones lejanas aciertan menos).
+- **Velocidad single (mismas condiciones): k=3 = 28.19 tok/s,
+  k=7 = 24.45 tok/s -> k=3 GANA en acceptance Y velocidad.**
+  La receta recomendaba k=3 y tenia razon: draft mas corto = menos
+  computo de draft por paso y commits mas seguros.
+- Caveat: ambas cifras absolutas son menores que las de F7 (51-60
+  con k=7) - condiciones de reloj/termal no identicas entre sesiones;
+  el A/B interno k3-vs-k7 es el dato solido (misma sesion, mismo
+  estado). Re-verificar clocks si el absoluto importa.
+- Produccion restaurada OK tras el A/B.
