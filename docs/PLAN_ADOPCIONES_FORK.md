@@ -676,3 +676,44 @@ unsloth-zoo, notebooks), investigación drivers/eco-sistema Volta.
 - WIP perdido: `csrc/local_sm70_stubs.cpp` era untracked y se perdió en el
   branch switch; solo sobrevive el hunk de CMakeLists en `stash@{0}`.
   Regenerar los stubs desde los link-errors del build SM70 en F2.
+
+
+## Sprint F6 — Hook LHU→scheduler: perfiles energéticos por fase (PROPUESTO 2026-09-07)
+
+**Objetivo**: eliminar la degradación +11-12% de LHU v4.1 en prefill pesado
+concurrente (comparativa 20260829) conmutando el perfil energético POR FASE
+del scheduler en vez de por telemetría externa.
+
+1. Hook post-step en el scheduler v1 (estado: prefill-batch presente /
+   decode puro / idle) -> API de modos de lhu_optimizer_v41.
+2. Mapa de fases: prefill = HBM alta + SM flexibles; decode = lock -lgc 1530;
+   idle = 135MHz + PL 225W + NVMe PS3. Conmutar por FASE (estable s-min),
+   nunca por paso (jitter).
+3. A/B con metodología oficial (vllm bench serve): TTFT/ITL x1/x4 + watts.
+   Éxito: eliminar la degradación +11-12% sin perder el -21% TTFT ligero.
+**Bonus**: la composición de batch expuesta alimenta contramedidas del
+patrón #490 (PL extra en mixed-batch).
+
+## Sprint F7 — MTP en la receta estrella: amortización de lecturas de pesos (PROPUESTO 2026-09-07)
+
+**Motivación (contraste Cerebras)**: su 1500 tok/s sale de pesos SRAM-residentes
+(21 PB/s on-die, sin HBM). En V100 el techo físico de decode es
+ancho_banda/bytes_pesos (~66 tok/s en QUASAR NVFP4 TP2, medimos 45 = 68%).
+La única palanca equivalente es **amortizar la lectura de pesos con
+multi-token**: MTP k del propio checkpoint (la familia 27B lo trae; skinny
+ya probó k=7 -> 52 tok/s committed con ~8.8 rounds/s, i.e. solo usa
+~119 GB/s del ancho de banda = margen 7x sin usar).
+
+1. Habilitar MTP k en la config estrella 1.5.0-dev TP2 (QUASAR/AWQ-MTP
+   traen cabezas); vigilar familia #534 (hang graph MTP batch-shrink, era
+   TP4) — en TP2 single-stream no debería aplicar.
+2. A/B oficial: single-stream 45 -> objetivo 80-100+; luego concurrencia.
+3. Si ok: receta producción :8010 con MTP.
+
+## Tooling — Oráculo Cerebras para gates de calidad (PROPUESTO 2026-09-07)
+
+- Free trial ($5) + catálogo qwen-3.8-27b (64k ctx) como **referencia
+  full-precision** de nuestra familia: miles de outputs greedy remotos ->
+  desviación de nuestras rutas NVFP4/int8+clip (determinism probe con
+  oráculo externo). Burst-compute para corpora de eval (minutos vs horas
+  de V100). Narrativa F5: precio-prestación, no velocidad bruta.
