@@ -704,11 +704,14 @@ multi-token**: MTP k del propio checkpoint (la familia 27B lo trae; skinny
 ya probó k=7 -> 52 tok/s committed con ~8.8 rounds/s, i.e. solo usa
 ~119 GB/s del ancho de banda = margen 7x sin usar).
 
-1. Habilitar MTP k en la config estrella 1.5.0-dev TP2 (QUASAR/AWQ-MTP
-   traen cabezas); vigilar familia #534 (hang graph MTP batch-shrink, era
-   TP4) — en TP2 single-stream no debería aplicar.
-2. A/B oficial: single-stream 45 -> objetivo 80-100+; luego concurrencia.
-3. Si ok: receta producción :8010 con MTP.
+1. ✅ HECHO (2026-09-07): MTP k=7 habilitado (RadixArk trae cabezas,
+   `mtp.fc.weight`+14; arquitectura Qwen3_5MTP). Familia #534 NO aplica en TP2.
+2. ✅ RESULTADOS (bench oficial): single 1024@256 = **51.2-60.3 tok/s
+   committed** (+25% vs 45 sin MTP; supera skinny 52.2; TTFT 725ms).
+   Concurrente 8x4096@256 = **34.71 agg (+13% vs 30.63 control mismo
+   checkpoint), TTFT mean -55% (16.2s vs 35.8s)**, 8/8 sin stall.
+3. SIGUIENTE: receta producción :8010 con MTP + medir acceptance real
+   con texto LHU (random tokens subestiman acceptance).
 
 ## Tooling — Oráculo Cerebras para gates de calidad (PROPUESTO 2026-09-07)
 
