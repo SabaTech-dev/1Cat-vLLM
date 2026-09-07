@@ -409,3 +409,24 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
   se acumula por paso compartido, no es un impuesto fijo.
 - Publicado en #490 (5567006760) con la nota del boundary 64K=8
   chunks como pista para el fix.
+
+## 2026-09-07e - F7: MTP k=7 en la receta estrella - gana en single Y concurrente
+
+- Checkpoint RadixArk NVFP4 trae cabezas MTP (mtp.fc.weight +14 en
+  model-00003); arquitectura resuelta Qwen3_5MTP. Flags: envs
+  SM70 MTP DEFAULTS + --speculative-config '{"method":"mtp",
+  "num_speculative_tokens":7,"draft_sample_method":"greedy",
+  "use_local_argmax_reduction":true}'.
+- **Single 1024@256: 51.2-60.3 tok/s committed** (2 runs, median ~56)
+  vs ~45 sin MTP (+25%) y vs skinny k=7 52.2. TTFT 725ms (!) por
+  1024 tok (FA_V100 prefill muy superior al skinny 9.1s).
+- **Concurrente 8x4096@256 rate 8**: 34.71 tok/s agg con MTP vs
+  30.63 control sin MTP mismo checkpoint/arm (+13%), **TTFT mean
+  16.2s vs 35.8s (-55%)**. 8/8 OK sin stall (familia #534 no aplica
+  en TP2 single/multi razonable).
+- Contraste Cerebras: nuestro mejor single-stream 60.3 vs 1500
+  (25-48x, fisica WSE). La direccion MTP es correcta: menos lecturas
+  de peso por token comprometido.
+- pkill self-kill OTRA VEZ (printf con 'vllm serve' literal en el
+  mismo comando) - REGLA ABSOLUTA: kill SIEMPRE aislado, jamas en el
+  mismo bash -c que genere contenido con el patron.
