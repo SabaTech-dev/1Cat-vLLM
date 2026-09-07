@@ -364,3 +364,18 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
   (solo el launcher) -> workers zombis sosteniendo 30GB/GPU y
   produccion fail-load. Matar SIEMPRE verificando
   nvidia-smi --query-compute-apps despues de cada server.
+
+## 2026-09-07b - Skinny MNS=4: funciona pero colapsa 22x
+
+- Skinny stack con MNS=4 ARRANCA limpio (sin hang de captura) y
+  sirve 4/4 concurrentes SIN stall - pero **9.64 tok/s agregados**
+  (~2.4/stream) vs **52.18 single-stream** = colapso x22. El MNS=1
+  comunitario es por RENDIMIENTO, no solo por estabilidad: el batch
+  mixto prefill+decode degrada igual que en 1.5.0 (#490 familia,
+  aunque aqui sin stall).
+- Veredicto final del contraste comunitario: skinny = especialista
+  single-stream (MTP k=7, 52 tok/s); estrella = champion de serving
+  concurrente (88-99 tok/s agg x4-8 a 32K). Para LHU multi-usuario,
+  la estrella sigue siendo la receta.
+- /tmp se arraso de nuevo (cleanup del boot) - regla: los scripts de
+  bench viven en git; los corpus se regeneran on-demand.
