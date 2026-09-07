@@ -394,3 +394,18 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
   (64K/128K/192K). Arm runner en /tmp (regenerable; patron en git).
 - Produccion restaurada OK; workers verificados muertos via
   compute-apps antes de relanzar.
+
+## 2026-09-07d - Bisect del acantilado #490: gradiente suave, vuelco 32K->64K
+
+- Curva completa (8K fijo vs partner variable): 35.6 (8K) / 11.0
+  (32K) / **2.03 (64K)** / 0.84 (128K) / 0.86 (192K) / 0.14-0.48
+  (240K). El vuelco esta entre 32K y 64K (64K = 8 chunks de 8192).
+  Meseta 0.85-2 en 64K-192K, profunda de nuevo en 240K. Dos regimenes
+  con transicion, no un acantilado unico.
+- El decode del largo declina suave con su largo (32.3->21.3, escala
+  normal). La anomalia es SOLO el co-residente decoder.
+- Nuance de scheduling: con partner >=128K el TTFT del corto cae a
+  ~1s (entra antes a decode, absorbe mas ventana) -> la contaminacion
+  se acumula por paso compartido, no es un impuesto fijo.
+- Publicado en #490 (5567006760) con la nota del boundary 64K=8
+  chunks como pista para el fix.
