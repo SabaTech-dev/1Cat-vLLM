@@ -430,3 +430,21 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
 - pkill self-kill OTRA VEZ (printf con 'vllm serve' literal en el
   mismo comando) - REGLA ABSOLUTA: kill SIEMPRE aislado, jamas en el
   mismo bash -c que genere contenido con el patron.
+
+## 2026-09-07f - MULTIMODAL EN EL FORK: funcionando (lyf NVFP4-MTP-VL TP2)
+
+- **Vision sobre V100 en 1cat-vllm sprint CONFIRMADA**: checkpoint
+  lyf/Qwen3.8-27B-Heretic-ARA-NVFP4-MTP-VL (Qwen3_5ForConditionalGeneration,
+  vision_config ViT 1152, NVFP4 compressed-tensors, 20GB, 2 shards) carga
+  y SIRVE vision a la primera: describio exactamente imagen de test
+  (circulo rojo + rectangulo amarillo + fondo azul). Vision tower via
+  MMEncoderAttention -> TORCH_SDPA (Volta OK).
+- Resultados (TP2, MNS=6, 131K ctx, fp8 KV, APC, MTP): texto single
+  1024@256 = 47.7 tok/s (TTFT 1.1s); texto x6 4096@256 = 46.6 agg,
+  6/6 OK (vs skinny x4 9.6); vision cold ~8s e2e, misma imagen x3
+  concurrente ~1s (APC cachea tambien los tokens visuales).
+- La imagen ocupa ~221 prompt tokens (448px, patches mergeados) -
+  APC aplica a prefijos visuales identicos.
+- Descarga en /home/joker/v100-qwen38/lyf-vl (persistente). Con esto,
+  la Opcion 1 (vLLM estrella TP2) ya tiene TODAS las capacidades de
+  la produccion actual salvo... nada: texto+vision+MTP+APC+131K.
