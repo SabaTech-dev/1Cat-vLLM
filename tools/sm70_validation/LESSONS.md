@@ -379,3 +379,18 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
   la estrella sigue siendo la receta.
 - /tmp se arraso de nuevo (cleanup del boot) - regla: los scripts de
   bench viven en git; los corpus se regeneran on-demand.
+
+## 2026-09-07c - Arms asimetricos #490: el colapso escala con el prefill del OTRO
+
+- Arms en SXM2 (fp8+APC+262K, seqs 3, greedy, streaming per-request):
+  A 8K+240K -> corto colapsa a 0.48 tok/s DURANTE los 346s de prefill
+  del largo (que luego decodifica sano a 21.3). B 32K+240K -> corto a
+  0.14. C control 8K+32K SIN colapso (35.6/11.0 sanos).
+- **Umbral del acantilado entre 32K y 240K de largo de prefill co-
+  residente.** El dano es unidireccional: paga quien decodifica
+  durante el prefill largo. El 2x240K previo (ambos a 0.2-0.3) se lee
+  ahora como la misma regla, no un caso especial.
+- Publicado en #490 (5566577427) con oferta de bisectar el acantilado
+  (64K/128K/192K). Arm runner en /tmp (regenerable; patron en git).
+- Produccion restaurada OK; workers verificados muertos via
+  compute-apps antes de relanzar.
