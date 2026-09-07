@@ -337,3 +337,30 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
 - Stack comunitario alternativo a contrastar: v100-skinny (kernels
   NVFP4 W4A16 hand-written) 61-74 tok/s PCIe / 95-118 SXM2 con MTP
   k=7 vs nuestro TurboMind compressed-tensors.
+
+## 2026-09-07 - Migracion metodologica oficial + stack v100-skinny en SXM2
+
+- **Bench oficial vllm bench serve sobre la receta estrella** (TP2,
+  FA_V100+fp8+APC, QUASAR): 8x32K@256 cold request-rate 8 -> 8/8 OK,
+  TTFT mean 179s / p99 364s, output 5.37 tok/s agg (prefill-dominated).
+  Consistente con el harness ad-hoc -> cross-validacion OK. Flags del
+  fork: --base-url SIN /v1 (doble path = Not Found), auth por env
+  OPENAI_API_KEY, --save-result es boolean + --result-dir.
+- **GDN exactness (harness oficial benchmark_sm70_gdn_exactness.py):
+  sprint vs main wheel = torch.equal PERFECTO** (out y final_state,
+  max_diff 0.0) -> nuestro branch no perturba la numeria GDN. Gate de
+  regresion adoptado. Necesita GPUs con holgura (OOM junto al server).
+- **Stack v100-skinny (1.2.2 + kernels QPN + RadixArk NVFP4) FUNCIONA
+  en nuestro SXM2 2x32GB TP2**: bootstrap con REQUIRE_GPUS=2 (su check
+  asume TP4x16GB), JIT QPN2/QPN8 con CUDA 12.8 + ninja en PATH,
+  served-model-name 'qwen3.8-27b' (punto!), server sin auth.
+  **52.18 tok/s single-stream (MTP k=7, MNS=1)** con bench oficial
+  (4x1024@256 serial, ITL mediana 46ms). Su publicado PCIe: 61-74.
+- **Contraste skinny vs estrella**: skinny = maximo single-stream
+  (MTP, concurrencia limitada a 1 por los bugs upstream #490/#505);
+  estrella = serving concurrente (88-99 tok/s agg x4-8 a 32K warm,
+  45 tok/s/stream corto sin MTP). Regimenes distintos, tools distintos.
+- Gotcha recurrente CONFIRMADO: pkill -f no matchea VLLM::Worker_*
+  (solo el launcher) -> workers zombis sosteniendo 30GB/GPU y
+  produccion fail-load. Matar SIEMPRE verificando
+  nvidia-smi --query-compute-apps despues de cada server.
