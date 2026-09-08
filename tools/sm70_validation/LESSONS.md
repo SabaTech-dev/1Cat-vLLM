@@ -509,3 +509,25 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
   qwen3 + tool-parser qwen3_coder + seqs 6 + 131K (262K sin MTP).
 - Pendiente menor: confirmar k=5@8192 con mas runs (el acceptance
   idico ya valida la consistencia).
+
+## 2026-09-08 - Sweep MBT 2048-32768: 16384 confirmado optimo
+
+- MBT sweep k=5 (2048/4096/32768 + 8192/16384 previos): 16384 sigue
+  siendo el sweet spot (single 47.9, x6 53.1). 32768 hunde el single
+  (26.4) aunque x6 decente (51.0). 2048 correcto sin ganar (43.9/48.2).
+  **La hipotesis anti-colapso de chunks pequenos NO se confirmo** (x6
+  2048 = 48.2 < 16384 = 53.1).
+- Acceptance k=5 estable en 2048/8192/16384 (66.4% exacto) pero baja
+  a 57.8-59.3% en 4096/32768 - el MBT afecta al draft via chunking.
+- DFlash2 en el fork: metodos dflash/dflash_ddtree/dspark nativos +
+  envs SM70 (VLLM_SM70_DFLASH2_QPN8_RERANK/_SHADOW/_QPN8_DENSE_ORDER).
+  El VLLM_DFLASH2_CHAIN del operador no existe en nuestro arbol (otra
+  version). #562 (hoy): DFlash2 lee estado GDN reciclado -> assertion.
+  #478 era TP4 - TP2 SIN PROBAR.
+- nerkyor EfficientThink DFlash2: repo multi-formato (47 shards, BF16
+  12x + FP8 + NVFP4 con subvariantes W4A16/W4A4/W8A16 + drafters
+  DFlash2-FP8 embebidos). Para Volta: NVFP4/W4A16 (20.6GB, 6 shards,
+  Qwen3_5ForConditionalGeneration, MULTIMODAL, drafter DFlash2-FP8
+  como subdirectorio). El repo NO testeo vLLM+DFlash2 (foco SGLang/GGUF).
+- hf download: --include ignorado con rutas explicitas; dirigir por
+  --include "subdir/*" tras inspeccionar el arbol via API tree.
