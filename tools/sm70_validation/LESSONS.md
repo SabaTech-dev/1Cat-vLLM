@@ -491,3 +491,21 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
   v2 = launcher parametrizado + script por-k con logging por paso ->
   funciono a la primera. Leccion: scripts de barrido con logging por
   paso y sin heredocs anidados.
+
+## 2026-09-07i - Auditoria de flags + E1: MBT=16384 es un win claro
+
+- **Auditoria**: 'use_local_argmax_reduction' ES real (leido por
+  llm_base_proposer.py). 'draft_sample_method' NO existe en el fork -
+  key muerta ignorada silenciosamente (la oficial es
+  'rejection_sample_method' pero en NUESTRA version solo acepta
+  'standard'|'synthetic' - 'strict' de main ROMPE el boot). Eliminada.
+- **E1 (k=5 + --max-num-batched-tokens 16384)**: acceptance 66.4%
+  (identico al sweep k=5@8192 - la acceptance es propiedad del modelo,
+  metrica estable ✓). **Single 47.91 tok/s (+12% vs 42.64 sweep),
+  x6 @4096 = 53.11 agg (6/6 OK, +13% vs 46.88) - el mejor numero
+  concurrente medido en este stack.**
+- RECETA FINAL estrella v2: RadixArk NVFP4 + FA_V100 + fp8_e5m2 KV +
+  APC + MTP k=5 + use_local_argmax_reduction + MBT=16384 + parser
+  qwen3 + tool-parser qwen3_coder + seqs 6 + 131K (262K sin MTP).
+- Pendiente menor: confirmar k=5@8192 con mas runs (el acceptance
+  idico ya valida la consistencia).
