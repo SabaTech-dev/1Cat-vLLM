@@ -549,3 +549,23 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
   conversacion y LESSONS previas). DFlash2 queda como alternativa
   documentada (funciona en TP2, util si algun checkpoint futuro solo
   trae drafter DFlash2).
+
+## 2026-09-08c - DFlash2: el sampling method lo cambia todo (probabilistic +116%)
+
+- Serie DFlash2 k=7 NATIVO (nerkyor, drafter embebido, TP2):
+  argmax = 50.4% acc / 19.1 tok/s; **probabilistic = 50.4% / 41.3
+  (+116%!)**; **probabilistic + ngram_assist(min2,max5) = 45.1
+  tok/s / x6 41.7**. El acceptance agregado (37.7-61.8%) no es
+  comparable entre modos: con ngram los hits son point-mass y el
+  contador no refleja el beneficio real.
+- **El metodo de sampling del draft es el knob dominante de DFlash2**
+  (el usuario tenia razon: greedy/argmax estrangula al drafter).
+  draft_sample_method=probabilistic SI existe en nuestro fork
+  (llm_base_proposer:400 - mi grep anterior quedo truncado, correccion).
+- DFlash2 nativo = k=7 (block-8). k=5 era sub-ancho.
+- Veredicto global spec-decode: MTP k=5 sigue campeon (47.9/53.1)
+  pero DFlash2-prob-ngram queda a 6% en single (45.1) con checkpoint
+  MULTIMODAL nativo - alternativa legitima.
+- pkill self-kill: tercera ocurrencia (launch tras pkill en mismo
+  bash -c con patron literal). Regla ya en LESSONS - volver a incidir
+  es fallo de disciplina propia.
