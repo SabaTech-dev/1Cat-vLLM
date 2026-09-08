@@ -531,3 +531,21 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
   como subdirectorio). El repo NO testeo vLLM+DFlash2 (foco SGLang/GGUF).
 - hf download: --include ignorado con rutas explicitas; dirigir por
   --include "subdir/*" tras inspeccionar el arbol via API tree.
+
+## 2026-09-08b - DFlash2 TP2 probado: funciona pero MTP k=5 gana
+
+- DFlash2 (nerkyor EfficientThink NVFP4/W4A16 + drafter DFlash2-FP8
+  embebido, TP2, k=5, MBT=16384): **acceptance 61.8%, single 32.8
+  tok/s, x6 35.7 agg** - 6/6 OK sin assertion (#562 no aparecio en
+  esta forma de uso; #478 acceptance=0 NO reproduce en TP2).
+- **MTP k=5 (estrella v2) gana en todo**: single 47.9 vs 32.8 (+46%),
+  x6 53.1 vs 35.7 (+49%), acceptance 66.4 vs 61.8.
+- MBT sweep completo (k=5): 2048=43.9/48.2, 4096=47.1/46.9,
+  **16384=47.9/53.1 (ganador)**, 32768=26.4/51.0. Chunks pequenos NO
+  reducen el colapso. 16384 optimo confirmado en ambos regimenes.
+- Acceptance k=5 estable en 2048/8192/16384 (66.4 exacto) - propiedad
+  del modelo; baja en 4096/32768 (57.8/59.3, el MBT afecta al draft).
+- RECETA FINAL: estrella v2 con MTP k=5 + MBT=16384 (script en
+  conversacion y LESSONS previas). DFlash2 queda como alternativa
+  documentada (funciona en TP2, util si algun checkpoint futuro solo
+  trae drafter DFlash2).
