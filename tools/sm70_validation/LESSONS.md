@@ -569,3 +569,20 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
 - pkill self-kill: tercera ocurrencia (launch tras pkill en mismo
   bash -c con patron literal). Regla ya en LESSONS - volver a incidir
   es fallo de disciplina propia.
+
+## 2026-09-08d - Sin-spec 262K+VL: record x6 (61.1); MTP estorba en concurrencia
+
+- **Contexto con DFlash2 = 262K completo** (el drafter DFlash2-FP8
+  declara max_position_embeddings 262144 - sin el cap 131K del draft
+  MTP).
+- **lyf-vl SIN spec a 262144 + MBT=16384 + APC + parser flags**:
+  pool 994K tokens (concurrencia 3.79x a full), smoke 182K texto +
+  imagen PERFECTO (descrito exactamente, 239s e2e), **single 31.3
+  tok/s con ITL 22.3ms (la mas baja medida)**, **x6 @4096 = 61.12
+  agg (record absoluto del stack, TTFT 14.6s, ITL 28.7ms)**.
+- **Hallazgo clave: MTP ayuda single (47.9 vs 31.3) pero ESTORBA en
+  x6 (53.1 vs 61.1)** - mismo patron que la receta Flash-Next
+  documenta ("MTP made throughput worse at every concurrency").
+  La decision spec-decode es por WORKLOAD, no absoluta.
+- Receta dual recomendada: modo interactivo = MTP k=5; modo
+  multi-usuario concurrente = sin spec (ademas regala 262K nativo).
