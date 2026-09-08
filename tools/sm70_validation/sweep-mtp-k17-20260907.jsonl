@@ -1,0 +1,7 @@
+{"k":1,"acceptance_pct":91.0,"single_tps_itl":"30.46,45.21","x6_ok_tps_ttft_itl":"6,44.10,14893.47,60.03"}
+{"k":2,"acceptance_pct":77.6,"single_tps_itl":"26.74,50.35","x6_ok_tps_ttft_itl":"6,32.53,16532.28,74.12"}
+{"k":3,"acceptance_pct":70.4,"single_tps_itl":"27.20,54.10","x6_ok_tps_ttft_itl":"6,39.94,14066.43,83.84"}
+{"k":4,"acceptance_pct":69.6,"single_tps_itl":"25.02,59.46","x6_ok_tps_ttft_itl":"6,27.45,21879.69,89.78"}
+{"k":5,"acceptance_pct":66.4,"single_tps_itl":"42.64,61.51","x6_ok_tps_ttft_itl":"6,46.88,14215.68,111.64"}
+{"k":6,"acceptance_pct":63.1,"single_tps_itl":"25.09,65.88","x6_ok_tps_ttft_itl":"6,41.97,13697.59,122.05"}
+{"k":7,"acceptance_pct":53.4,"single_tps_itl":"26.34,68.53","x6_ok_tps_ttft_itl":"6,46.05,14449.44,127.13"}
