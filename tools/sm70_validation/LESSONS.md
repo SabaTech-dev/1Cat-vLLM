@@ -468,3 +468,26 @@ Engram paraentre sesiones). Complementa el README de tools/sm70_validation.
   el A/B interno k3-vs-k7 es el dato solido (misma sesion, mismo
   estado). Re-verificar clocks si el absoluto importa.
 - Produccion restaurada OK tras el A/B.
+
+## 2026-09-07h - Sweep MTP k=1..7 completo (acceptance + single + x6)
+
+- Barrido systematico (mismo harness v2, 6/6 OK por k, x6 @4096@256):
+  acceptance DECRECE monotono con k: 91.0 (k=1) / 77.6 / 70.4 / 69.6 /
+  **66.4 (k=5)** / 63.1 / 53.4 (k=7). Textbook.
+- Single: plateau 25-30 en casi todos PERO **k=5 = 42.64 outlier
+  alto**, y su x6 tambien la mejor (46.88 agg). k=1 = mejor ITL
+  (45.2ms, snappiest) y mejor acceptance (91%).
+- x6: 27-47 agg todo 6/6 OK (k=5 46.9 > k=7 46.1 > k=1 44.1).
+- **Misterio F7 (k=7 a 51-60 antes, 26 hoy): NO era el env faltante**
+  (sweep uso envs F7-exactos). Explicacion parcial: los benches del
+  sweep corrian con 3x12K prefijos residentes en cache (tests de
+  acceptance previos) vs F7 que bencheaba server recien-arrancado.
+  Varianza sesion-a-sesion ~2x documentada; los relativos intra-sweep
+  son solidos.
+- Veredicto: k=5 candidato sweet-spot (necesita re-validacion 3-runs
+  por el ruido 1-run); k=1 para interactividad (ITL 45ms + 91%
+  acceptance). Registrar sweep-results.jsonl como dato.
+- El sweep script v1 murio 7x en silencio (heredoc anidado sospechoso);
+  v2 = launcher parametrizado + script por-k con logging por paso ->
+  funciono a la primera. Leccion: scripts de barrido con logging por
+  paso y sin heredocs anidados.
