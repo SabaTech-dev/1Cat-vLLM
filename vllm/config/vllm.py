@@ -80,10 +80,17 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
         "Qwen4ExpForConditionalGeneration",
     }
 )
-_SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16)
-_SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 4, 6, 8, 12, 16)
+_SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16, 32)
+_SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16)
+_SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
 
-_SM70_NVFP4_DFLASH2_PRACTICAL_DEFAULTS = {
+_SM70_DFLASH2_VERIFIER_DEFAULTS = {
+    # Preserve candidate and dense logits in FP32 through sampling.
+    "VLLM_SM70_DFLASH2_FP32_LOGITS": "1",
+    # This is the target projection's memory-neutral FP8 layout, not the
+    # rejected draft-MLP QPN8 experiment. Per-layer TP/shape checks retain the
+    # original layout whenever the exact operator contract is unavailable.
+    "VLLM_SM70_FP8_QPN8": "1",
     "VLLM_SM70_DFLASH2_QPN8_RERANK": "1",
     "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER": "1",
     "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER": "0",
@@ -98,43 +105,50 @@ _SM70_NVFP4_DFLASH2_PRACTICAL_DEFAULTS = {
     "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": "1",
 }
 
+_SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS = {
+    "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": "1",
+    "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": "1",
+    "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA": "1",
+    "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA": "1",
+    "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": "1",
+    "VLLM_SM70_DFLASH2_BF16_EMULATION": "1",
+    "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": "0.9",
+    "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": "0.95",
+    # The sparse target sampler is not part of the retained GLM quality route.
+    "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": "0",
+    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY": "1",
+    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN": "1",
+    "VLLM_SM70_GLM53_TP8_CUBLASLT": "1",
+    "VLLM_SM70_GLM53_TP8_FUSED_FG_B": "1",
+    "VLLM_SM70_GLM53_MHC_NATIVE_VERIFY": "1",
+    "VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8": "1",
+    "VLLM_SM70_GLM_MHC_PRE_THREADS": "1024",
+    "VLLM_SM70_GLM53_MOE_QPN_W13_Q8": "0",
+    "VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS": "1",
+    "VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR": "1",
+    "VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR": "1",
+    "VLLM_USE_AOT_COMPILE": "0",
+}
 
-def _is_compressed_tensors_nvfp4(model_config: Any) -> bool:
-    """Recognize NVFP4, including mixed-precision config groups."""
-    if getattr(model_config, "quantization", None) != "compressed-tensors":
-        return False
-    model_arch_config = getattr(model_config, "model_arch_config", None)
-    quant_config = getattr(model_arch_config, "quantization_config", None)
-    if not isinstance(quant_config, Mapping):
-        return False
 
-    formats = [quant_config.get("format", "")]
-    config_groups = quant_config.get("config_groups", {})
-    if isinstance(config_groups, Mapping):
-        formats.extend(
-            group.get("format", "")
-            for group in config_groups.values()
-            if isinstance(group, Mapping)
-        )
-    return any("nvfp4" in str(format_name).lower() for format_name in formats)
-
-
-def _is_sm70_nvfp4_dflash2_practical_contract(
+def _is_sm70_dflash2_verifier_contract(
     model_config: Any,
     speculative_config: Any,
     parallel_config: Any,
-    scheduler_config: Any,
-    cache_config: Any,
 ) -> bool:
-    """Admit only the scored Qwen3.8 NVFP4 DFlash2 TP4/B1 contract."""
+    """Admit the quality-audited Qwen3.8 DFlash2 verifier contract.
+
+    Target quantization, KV dtype, TP degree, and service capacity are
+    intentionally not part of this admission. Each fast operator capability-
+    checks its local weight, cache dtype, and live batch shape, then falls back
+    independently when it cannot handle that contract.
+    """
     if any(
         config is None
         for config in (
             model_config,
             speculative_config,
             parallel_config,
-            scheduler_config,
-            cache_config,
         )
     ):
         return False
@@ -151,7 +165,6 @@ def _is_sm70_nvfp4_dflash2_practical_contract(
     architectures = set(getattr(model_config, "architectures", ()) or ())
     return bool(
         "Qwen3_5ForConditionalGeneration" in architectures
-        and _is_compressed_tensors_nvfp4(model_config)
         and getattr(model_config, "dtype", None) == torch.float16
         and getattr(hf_text_config, "hidden_size", None) == 5120
         and getattr(hf_text_config, "num_attention_heads", None) == 24
@@ -161,27 +174,172 @@ def _is_sm70_nvfp4_dflash2_practical_contract(
         and int(getattr(speculative_config, "num_speculative_tokens", 0) or 0) == 7
         and selector_top_k == 16
         and getattr(parallel_config, "pipeline_parallel_size", 0) == 1
-        and getattr(parallel_config, "tensor_parallel_size", 0) == 4
         and not getattr(parallel_config, "enable_dbo", False)
         and int(getattr(parallel_config, "ubatch_size", 0) or 0) <= 1
-        and getattr(scheduler_config, "max_num_seqs", 0) == 1
-        and getattr(scheduler_config, "max_num_batched_tokens", 0) == 4096
-        and str(getattr(cache_config, "cache_dtype", "")).lower() == "fp8_e5m2"
     )
 
 
-def _apply_sm70_nvfp4_dflash2_practical_defaults() -> tuple[str, ...]:
+def _is_sm70_qwen38_nomtp_dual_compile_contract(
+    model_config: Any,
+    speculative_config: Any,
+    parallel_config: Any,
+) -> bool:
+    """Admit only the exact Qwen3.8 TP4 no-MTP dual-compile topology."""
+    if (
+        model_config is None
+        or parallel_config is None
+        or speculative_config is not None
+    ):
+        return False
+
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    architectures = set(getattr(model_config, "architectures", ()) or ())
+    multimodal_config = getattr(model_config, "multimodal_config", None)
+    supported_architecture = "Qwen4ExpForCausalLM" in architectures or (
+        "Qwen4ExpForConditionalGeneration" in architectures
+        and multimodal_config is not None
+        and getattr(multimodal_config, "language_model_only", False)
+    )
+    return bool(
+        supported_architecture
+        and getattr(model_config, "dtype", None) == torch.float16
+        and getattr(hf_text_config, "hidden_size", None) == 2560
+        and getattr(hf_text_config, "num_hidden_layers", None) == 48
+        and getattr(hf_text_config, "num_experts", None) == 512
+        and getattr(hf_text_config, "num_experts_per_tok", None) == 10
+        and getattr(hf_text_config, "moe_intermediate_size", None) == 640
+        and getattr(hf_text_config, "hc_count", None) == 4
+        and getattr(hf_text_config, "hc_lowrank", None) == 320
+        and getattr(hf_text_config, "num_attention_heads", None) == 24
+        and getattr(hf_text_config, "num_key_value_heads", None) == 2
+        and getattr(hf_text_config, "indexer_head_dim", None) == 128
+        and getattr(hf_text_config, "indexer_budget", None) == 2048
+        and getattr(hf_text_config, "indexer_compress_ratio", None) == 4
+        and getattr(parallel_config, "tensor_parallel_size", None) == 4
+        and getattr(parallel_config, "pipeline_parallel_size", None) == 1
+    )
+
+
+def _participating_cuda_device_ids(cfg: "VllmConfig") -> tuple[int, ...]:
+    """Local device assignment used by UniProc/Multiproc and GPUWorker.
+
+    Visibility is not participation: unused devices must not change engine
+    defaults. Ray/custom placement is not known here, so preserve the legacy
+    device-zero decision for those executors instead of guessing their ranks.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda() or current_platform.device_count() == 0:
+        return ()
+    parallel = cfg.parallel_config
+    backend = parallel.distributed_executor_backend
+    if backend == "external_launcher":
+        return (int(os.environ.get("LOCAL_RANK", "0")),)
+    if backend not in (None, "uni", "mp") or parallel.data_parallel_backend == "ray":
+        return (0,)
+    start = 0
+    if parallel.world_size == 1:
+        device = cfg.device_config.device
+        if isinstance(device, torch.device) and device.index is not None:
+            start = device.index
+    if parallel.nnodes_within_dp == 1:
+        dp_rank = parallel.data_parallel_rank_local
+        if dp_rank is None:
+            dp_rank = parallel.data_parallel_index
+        start += (
+            dp_rank * parallel.tensor_parallel_size * parallel.pipeline_parallel_size
+        )
+    return tuple(range(start, start + parallel.local_world_size))
+
+
+def _apply_sm70_qwen38_nomtp_defaults(
+    cfg: "VllmConfig", *, is_sm70: bool
+) -> tuple[str, ...]:
+    """Complete the admitted NVFP4 baseline without global experimental defaults."""
+    if not is_sm70 or not _is_sm70_qwen38_nomtp_dual_compile_contract(
+        cfg.model_config, cfg.speculative_config, cfg.parallel_config
+    ):
+        return ()
+    parallel = cfg.parallel_config
+    if (
+        cfg.model_config.quantization != "modelopt_fp4"
+        or cfg.lora_config is not None
+        or parallel.enable_expert_parallel
+        or parallel.enable_dbo
+        or parallel.data_parallel_size != 1
+        or parallel.nnodes_within_dp != 1
+        or cfg.cache_config.cache_dtype not in ("auto", "float16")
+        or cfg.cache_config.mamba_ssm_cache_dtype not in ("auto", "float32")
+    ):
+        return ()
+
+    defaults = {
+        "VLLM_SM70_QWEN38_FP16_GEMV": "1",
+        "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16": "1",
+        "VLLM_SM70_QWEN38_FUSED_HC_FP16": "1",
+        "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": "1",
+        "VLLM_SM70_MOE_ADD_ALLREDUCE": "1",
+    }
+    applied = []
+    for name, value in defaults.items():
+        if name not in os.environ:
+            os.environ[name] = value
+            applied.append(name)
+    return tuple(applied)
+
+
+def _any_participating_device_is_capability(
+    cfg: "VllmConfig", capability: tuple[int, int]
+) -> bool:
+    from vllm.platforms import current_platform
+
+    return any(
+        current_platform.is_device_capability(capability, device_id=device_id)
+        for device_id in _participating_cuda_device_ids(cfg)
+    )
+
+
+def _any_participating_device_is_pre_ampere(cfg: "VllmConfig") -> bool:
+    """Whether any participating CUDA device is Volta or Turing.
+
+    The SM70 Flash-V100 baseline is a pre-Ampere tuning, not a Volta tuning:
+    both capabilities take the same kernels, the same fp16 accumulation
+    contract and the same compile graph. Gating it on exactly (7, 0) leaves a
+    Turing-only deployment unconfigured, and that does not merely run slower.
+    """
+    return _any_participating_device_is_capability(
+        cfg, (7, 0)
+    ) or _any_participating_device_is_capability(cfg, (7, 5))
+
+
+def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
     """Set quality-audited defaults while preserving every explicit override."""
     applied = []
-    for env_name, env_value in _SM70_NVFP4_DFLASH2_PRACTICAL_DEFAULTS.items():
+    for env_name, env_value in _SM70_DFLASH2_VERIFIER_DEFAULTS.items():
         if env_name not in os.environ:
             os.environ[env_name] = env_value
             applied.append(env_name)
     return tuple(applied)
 
 
+def _apply_sm70_qwen38_hybrid_ple_defaults(
+    parallel_config: ParallelConfig,
+) -> None:
+    """Enable hybrid PLE and complete its late-bound parallel config."""
+    os.environ["VLLM_SM70_QWEN38_HYBRID_PLE"] = "1"
+    os.environ["VLLM_PLE_CPU_OFFLOAD"] = "1"
+    os.environ["VLLM_PLE_DISK_OFFLOAD"] = "1"
+    # ParallelConfig is validated before these model-aware defaults are
+    # applied, so initialize the endpoint that its validator would have
+    # created for an explicit PLE configuration.
+    parallel_config.ensure_ple_offload_ipc_path()
+
+
 def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
-    max_graph_reqs = min(max(int(max_num_seqs), 1), 16)
+    # B32 is the largest concurrency with end-to-end SM70 graph validation.
+    # Keep larger scheduler capacities usable through the regular piecewise
+    # path without forcing an unvalidated, memory-heavy full-graph capture.
+    max_graph_reqs = min(max(int(max_num_seqs), 1), 32)
     capture_sizes = {
         size for size in _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES if size <= max_graph_reqs
     }
@@ -200,6 +358,169 @@ def _sm70_mtp_cudagraph_capture_sizes(
     }
     request_sizes.add(max_graph_reqs)
     return [decode_query_len * size for size in sorted(request_sizes)]
+
+
+def _configure_sm70_glm5_dflash_tp4_push_allreduce(
+    model_config: ModelConfig | None,
+    speculative_config: SpeculativeConfig | None,
+    parallel_config: ParallelConfig,
+    *,
+    is_sm70: bool,
+) -> None:
+    """Keep the rejected GLM5 DFlash TP4 push collective diagnostic-only."""
+    if (
+        not is_sm70
+        or model_config is None
+        or getattr(model_config.hf_text_config, "model_type", None)
+        not in ("glm5_next", "glm5_next_text")
+        or speculative_config is None
+        or speculative_config.method != "dflash"
+        or parallel_config.tensor_parallel_size != 4
+    ):
+        return
+
+    env_name = "VLLM_SM70_TP4_PUSH_ALLREDUCE"
+    if env_name not in os.environ:
+        os.environ[env_name] = "0"
+        logger.info_once(
+            "Auto-setting %s=0 for SM70 GLM5 DFlash2 TP4 because the push "
+            "collective failed the retained output-quality audit. The ordinary "
+            "custom all-reduce remains enabled; other model routes keep their "
+            "existing default.",
+            env_name,
+        )
+    elif os.environ[env_name] != "0":
+        logger.warning_once(
+            "%s=%s explicitly enables a diagnostic-only GLM5 DFlash2 TP4 "
+            "route that failed the retained output-quality audit. Remove the "
+            "override or set it to 0 for the accepted production contract.",
+            env_name,
+            os.environ[env_name],
+        )
+
+
+def _configure_sm70_glm5_dflash_tp8_pp1_verifier_path(
+    model_config: ModelConfig | None,
+    speculative_config: SpeculativeConfig | None,
+    parallel_config: ParallelConfig,
+    *,
+    is_sm70: bool,
+) -> bool:
+    """Select the quality-qualified GLM-5.3 DFlash2 TP8 verifier path."""
+    if (
+        not is_sm70
+        or model_config is None
+        or getattr(model_config.hf_text_config, "model_type", None)
+        not in ("glm5_next", "glm5_next_text")
+        or getattr(model_config, "quantization", None) != "modelopt_fp4"
+        or getattr(model_config, "dtype", None) != torch.float16
+        or speculative_config is None
+        or speculative_config.method != "dflash"
+        or speculative_config.draft_sample_method != "probabilistic"
+        or speculative_config.num_speculative_tokens != 7
+        or parallel_config.tensor_parallel_size != 8
+        or parallel_config.pipeline_parallel_size != 1
+        or getattr(parallel_config, "enable_dbo", False)
+        or int(getattr(parallel_config, "ubatch_size", 0) or 0) > 1
+    ):
+        return False
+
+    configured = []
+    overrides = []
+    for name, value in _SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS.items():
+        if name not in os.environ:
+            os.environ[name] = value
+            configured.append(f"{name}={value}")
+        elif os.environ[name] != value:
+            overrides.append(f"{name}={os.environ[name]}")
+
+    if configured:
+        logger.info_once(
+            "Auto-selecting the quality-qualified SM70 GLM-5.3 DFlash2 "
+            "TP8/PP1 verifier path: %s.",
+            ", ".join(configured),
+        )
+    if overrides:
+        logger.warning_once(
+            "Explicit SM70 GLM-5.3 DFlash2 overrides differ from the retained "
+            "TP8/PP1 verifier contract: %s. Re-run the exactness, acceptance, "
+            "output-quality, and verifier-latency gates before production use.",
+            ", ".join(overrides),
+        )
+    return True
+
+
+def _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
+    model_config: ModelConfig | None,
+    speculative_config: SpeculativeConfig | None,
+    parallel_config: ParallelConfig,
+    *,
+    is_sm70: bool,
+) -> None:
+    """Select the retained GLM-5.3 DFlash2 acceptance path on V100."""
+    if (
+        not is_sm70
+        or model_config is None
+        or getattr(model_config.hf_text_config, "model_type", None)
+        not in ("glm5_next", "glm5_next_text")
+        or getattr(model_config, "quantization", None) != "modelopt_fp4"
+        or speculative_config is None
+        or speculative_config.method != "dflash"
+        or speculative_config.draft_sample_method != "probabilistic"
+        or speculative_config.num_speculative_tokens != 7
+        or parallel_config.tensor_parallel_size != 4
+        or parallel_config.pipeline_parallel_size != 2
+    ):
+        return
+
+    accepted_defaults = {
+        "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": "0.8",
+        "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": "0.95",
+    }
+    # A fixed partition must account for every layer. Other layer counts
+    # retain the normal partitioner rather than inheriting a 45-layer split.
+    if getattr(model_config.hf_text_config, "num_hidden_layers", None) == 45:
+        accepted_defaults["VLLM_PP_LAYER_PARTITION"] = "24,21"
+    configured = []
+    overrides = []
+    for name, value in accepted_defaults.items():
+        if name not in os.environ:
+            os.environ[name] = value
+            configured.append(f"{name}={value}")
+        elif os.environ[name] != value:
+            overrides.append(f"{name}={os.environ[name]}")
+
+    materialize = os.environ.get("VLLM_GLM53_PP_MHC_MATERIALIZE")
+    if materialize not in (None, "0"):
+        overrides.append(f"VLLM_GLM53_PP_MHC_MATERIALIZE={materialize}")
+
+    if configured:
+        logger.info_once(
+            "Auto-selecting the quality-qualified SM70 GLM-5.3 DFlash2 "
+            "TP4/PP2 path: %s.",
+            ", ".join(configured),
+        )
+    if overrides:
+        logger.warning_once(
+            "Explicit SM70 GLM-5.3 DFlash2 overrides differ from the retained "
+            "TP4/PP2 acceptance contract: %s. Re-run the acceptance and "
+            "output-quality gates before production use.",
+            ", ".join(overrides),
+        )
+
+
+def _sm70_speculative_cudagraph_capture_sizes(
+    max_num_seqs: int,
+    decode_query_len: int,
+) -> list[int]:
+    """Return bounded auxiliary and verifier shapes without a TP contract."""
+    verifier_sizes = _sm70_mtp_cudagraph_capture_sizes(
+        max_num_seqs,
+        decode_query_len,
+    )
+    return sorted(
+        set(_SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES) | set(verifier_sizes)
+    )
 
 
 class OptimizationLevel(IntEnum):
@@ -348,10 +669,15 @@ def apply_prefix_anchored_swa_constraints(cfg: "VllmConfig") -> None:
     from vllm.platforms import current_platform
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-    if not (
-        current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+    devices = _participating_cuda_device_ids(cfg)
+    if not devices or not all(
+        current_platform.is_device_capability((7, 0), device_id=device_id)
+        for device_id in devices
     ):
-        raise ValueError("prefix_anchored_decode_window requires an NVIDIA SM70 GPU")
+        raise ValueError(
+            "prefix_anchored_decode_window requires an NVIDIA SM70 GPU "
+            "for every participating rank"
+        )
 
     model_config = cfg.model_config
     if model_config is None:
@@ -1391,6 +1717,36 @@ class VllmConfig:
 
         from vllm.platforms import current_platform
 
+        _configure_sm70_glm5_dflash_tp4_push_allreduce(
+            self.model_config,
+            self.speculative_config,
+            self.parallel_config,
+            is_sm70=(
+                current_platform.is_cuda()
+                and _any_participating_device_is_capability(self, (7, 0))
+            ),
+        )
+        sm70_glm5_dflash_tp8_pp1_verifier = (
+            _configure_sm70_glm5_dflash_tp8_pp1_verifier_path(
+                self.model_config,
+                self.speculative_config,
+                self.parallel_config,
+                is_sm70=(
+                    current_platform.is_cuda()
+                    and _any_participating_device_is_capability(self, (7, 0))
+                ),
+            )
+        )
+        _configure_sm70_glm5_dflash_tp4_pp2_acceptance_path(
+            self.model_config,
+            self.speculative_config,
+            self.parallel_config,
+            is_sm70=(
+                current_platform.is_cuda()
+                and _any_participating_device_is_capability(self, (7, 0))
+            ),
+        )
+
         if (
             self.model_config is not None
             and self.scheduler_config.enable_chunked_prefill
@@ -1404,8 +1760,8 @@ class VllmConfig:
             )
 
         if envs.VLLM_SM70_USE_BREAKABLE_CUDAGRAPH:
-            if current_platform.is_cuda() and current_platform.is_device_capability(
-                (7, 0)
+            if current_platform.is_cuda() and _any_participating_device_is_capability(
+                self, (7, 0)
             ):
                 if "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ:
                     os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
@@ -1483,7 +1839,7 @@ class VllmConfig:
             and self.parallel_config.tensor_parallel_size <= 2
             and sm70_fp8_kv_requested
             and current_platform.is_cuda()
-            and current_platform.is_device_capability((7, 0))
+            and _any_participating_device_is_capability(self, (7, 0))
             and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
             and envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
             and "VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK" not in os.environ
@@ -1502,7 +1858,7 @@ class VllmConfig:
             and self.model_config.quantization == "fp8"
             and self.model_config.is_moe
             and current_platform.is_cuda()
-            and current_platform.is_device_capability((7, 0))
+            and _any_participating_device_is_capability(self, (7, 0))
             and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
             and envs.VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK
             and not envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
@@ -1524,7 +1880,7 @@ class VllmConfig:
         )
         sm70_flash_v100_baseline = (
             current_platform.is_cuda()
-            and current_platform.is_device_capability((7, 0))
+            and _any_participating_device_is_pre_ampere(self)
             and envs.VLLM_SM70_FLASH_ATTN_V100
             and sm70_flash_v100_backend
         )
@@ -1623,17 +1979,73 @@ class VllmConfig:
                         env_name,
                         env_value,
                     )
-            if _is_sm70_nvfp4_dflash2_practical_contract(
+            if (
+                not sm70_compile_disabled_by_user
+                and not sm70_no_compile_decode_graph_requested
+                and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            ):
+                for env_name in _apply_sm70_qwen38_nomtp_defaults(
+                    self,
+                    is_sm70=all(
+                        current_platform.is_device_capability((7, 0), device_id=i)
+                        for i in _participating_cuda_device_ids(self)
+                    ),
+                ):
+                    logger.info_once(
+                        "Auto-setting %s=1 for the quality-qualified SM70 "
+                        "Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.",
+                        env_name,
+                    )
+            if (
+                _is_sm70_qwen38_nomtp_dual_compile_contract(
+                    self.model_config,
+                    self.speculative_config,
+                    self.parallel_config,
+                )
+                and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+                and (
+                    envs.VLLM_SM70_QWEN38_FP16_GEMV
+                    or envs.VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16
+                    or envs.VLLM_SM70_QWEN38_FUSED_HC_FP16
+                )
+                and "VLLM_SM70_QWEN38_DUAL_COMPILE" not in os.environ
+            ):
+                os.environ["VLLM_SM70_QWEN38_DUAL_COMPILE"] = "1"
+                logger.info_once(
+                    "Auto-enabling the SM70 Qwen3.8 dual-compile lane: "
+                    "large prefill and FULL decode graphs share one model."
+                )
+            if (
+                _is_sm70_qwen38_nomtp_dual_compile_contract(
+                    self.model_config,
+                    self.speculative_config,
+                    self.parallel_config,
+                )
+                and envs.VLLM_SM70_QWEN38_DUAL_COMPILE
+                and not any(
+                    name in os.environ
+                    for name in (
+                        "VLLM_SM70_QWEN38_HYBRID_PLE",
+                        "VLLM_PLE_CPU_OFFLOAD",
+                        "VLLM_PLE_DISK_OFFLOAD",
+                    )
+                )
+            ):
+                _apply_sm70_qwen38_hybrid_ple_defaults(self.parallel_config)
+                logger.info_once(
+                    "Auto-enabling hybrid PLE for the SM70 Qwen3.8 "
+                    "dual-compile lane: async disk-mmap prefill plus local "
+                    "pinned-UVA decode."
+                )
+            if _is_sm70_dflash2_verifier_contract(
                 self.model_config,
                 self.speculative_config,
                 self.parallel_config,
-                self.scheduler_config,
-                self.cache_config,
             ):
-                for env_name in _apply_sm70_nvfp4_dflash2_practical_defaults():
+                for env_name in _apply_sm70_dflash2_verifier_defaults():
                     logger.info_once(
                         "Auto-setting %s=%s for the quality-audited SM70 "
-                        "Qwen3.8 NVFP4 DFlash2 TP4/B1 practical baseline. "
+                        "Qwen3.8 DFlash2 verification baseline. "
                         "Set it explicitly to override.",
                         env_name,
                         os.environ[env_name],
@@ -1656,7 +2068,7 @@ class VllmConfig:
                 )
             elif (
                 current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and _any_participating_device_is_capability(self, (7, 0))
                 and envs.VLLM_SM70_FLASH_ATTN_V100
             ):
                 self.compilation_config.mode = CompilationMode.VLLM_COMPILE
@@ -1703,31 +2115,15 @@ class VllmConfig:
                             )
                         else:
                             cudagraph_capture_sizes = (
-                                [1, 2, 4, 8, 9, 18]
-                                if self.parallel_config.tensor_parallel_size >= 4
-                                else [1, 2, 4, 8, 9]
-                            )
-                            max_graph_reqs = (
-                                4
-                                if self.parallel_config.tensor_parallel_size >= 4
-                                else 1
-                            )
-                            max_graph_reqs = min(
-                                max(int(self.scheduler_config.max_num_seqs), 1),
-                                max_graph_reqs,
-                            )
-                            cudagraph_capture_sizes = sorted(
-                                set(cudagraph_capture_sizes)
-                                | {
-                                    decode_query_len * num_reqs
-                                    for num_reqs in range(1, max_graph_reqs + 1)
-                                }
+                                _sm70_speculative_cudagraph_capture_sizes(
+                                    self.scheduler_config.max_num_seqs,
+                                    decode_query_len,
+                                )
                             )
                             logger.info_once(
-                                "Using SM70 speculative verifier cudagraph shapes "
-                                "%sx1..%s for Flash-V100 compile graph.",
-                                decode_query_len,
-                                max_graph_reqs,
+                                "Using bounded SM70 speculative cudagraph token "
+                                "shapes %s for Flash-V100 compile graph.",
+                                tuple(cudagraph_capture_sizes),
                             )
                     elif cudagraph_capture_sizes != [1, 2]:
                         logger.info_once(
@@ -1787,12 +2183,18 @@ class VllmConfig:
                         "Flash-V100 0.0.3 compile graph quality parity."
                     )
                 elif os.environ.get("VLLM_USE_AOT_COMPILE") == "0":
-                    logger.warning_once(
-                        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 with "
-                        "explicit VLLM_USE_AOT_COMPILE=0 is a diagnostic-only "
-                        "configuration: regular torch.compile reproduced "
-                        "deterministic greedy token drift."
-                    )
+                    if sm70_glm5_dflash_tp8_pp1_verifier:
+                        logger.info_once(
+                            "Using the quality-qualified regular torch.compile "
+                            "path for SM70 GLM-5.3 DFlash2 TP8/PP1."
+                        )
+                    else:
+                        logger.warning_once(
+                            "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH=1 with "
+                            "explicit VLLM_USE_AOT_COMPILE=0 is a diagnostic-only "
+                            "configuration: regular torch.compile reproduced "
+                            "deterministic greedy token drift."
+                        )
                 if envs.VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING:
                     logger.warning_once(
                         "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING=1: "
@@ -1843,7 +2245,7 @@ class VllmConfig:
                 )
             elif (
                 current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and _any_participating_device_is_capability(self, (7, 0))
                 and envs.VLLM_SM70_FLASH_ATTN_V100
             ):
                 capture_size = max(
@@ -1898,7 +2300,7 @@ class VllmConfig:
                 self.model_config is not None
                 and self.model_config.quantization == "fp8"
                 and current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and _any_participating_device_is_capability(self, (7, 0))
                 and envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
             )
 
@@ -2376,7 +2778,7 @@ class VllmConfig:
         """
         if self.speculative_config is not None:
             scheduled_token_delta = (
-                self.speculative_config.max_num_new_slots_for_drafting
+                self.speculative_config.max_num_new_target_slots_for_drafting
                 * self.scheduler_config.max_num_seqs
             )
             max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
@@ -2394,7 +2796,10 @@ class VllmConfig:
                     " to accommodate the additional draft token slots, or decrease"
                     " num_speculative_tokens or max_num_seqs."
                 )
-            if self.scheduler_config.max_num_scheduled_tokens < 8192:
+            if (
+                scheduled_token_delta > 0
+                and self.scheduler_config.max_num_scheduled_tokens < 8192
+            ):
                 logger.warning_once(
                     "max_num_scheduled_tokens is set to"
                     f" {self.scheduler_config.max_num_scheduled_tokens} based on"
@@ -2406,7 +2811,7 @@ class VllmConfig:
 
             max_num_scheduled_tokens = self.scheduler_config.max_num_scheduled_tokens
             if max_num_batched_tokens < max_num_scheduled_tokens + (
-                self.speculative_config.max_num_new_slots_for_drafting
+                self.speculative_config.max_num_new_target_slots_for_drafting
                 * self.scheduler_config.max_num_seqs
             ):
                 raise ValueError(
@@ -2615,16 +3020,15 @@ class VllmConfig:
         if (
             compile_range_end is not None
             and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-            and envs.VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE
             and compilation_config.mode == CompilationMode.VLLM_COMPILE
             and compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
         ):
-            # FULL decode capture can enter the compiled piecewise wrapper with
+            # FULL capture can enter the compiled piecewise wrapper with
             # max_num_batched_tokens + one decode token. Keep scheduler capacity
             # unchanged, but allow the wrapper to select a compiled range.
             compile_range_end += 1
             logger.info_once(
-                "Extending SM70 Flash-V100 0.0.3 decode-only compile range "
+                "Extending SM70 Flash-V100 0.0.3 compile range "
                 "endpoint to %d for CUDA graph capture.",
                 compile_range_end,
             )
@@ -2853,12 +3257,6 @@ class VllmConfig:
                 and self.parallel_config.pipeline_parallel_size > 1
             ):
                 unsupported.append("EAGLE3 with pipeline parallelism")
-            if (
-                speculative_config.method == "dflash"
-                and self.parallel_config.pipeline_parallel_size > 1
-            ):
-                unsupported.append("DFlash with pipeline parallelism")
-
         if self.parallel_config.enable_dbo:
             unsupported.append("dual batch overlap")
 

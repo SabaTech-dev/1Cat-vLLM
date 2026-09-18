@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <string>
 #include <type_traits>
@@ -13,11 +14,14 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cub/block/block_radix_sort.cuh>
 
 #include "fp8_kv_utils.cuh"
 #include "fused_mma.h"
 
 namespace {
+
+std::atomic<int64_t> tp2_e4m3_scalar_fast_calls{0};
 
 int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
   if (kv_cache_dtype == "auto" || kv_cache_dtype == "float16" ||
@@ -272,7 +276,7 @@ bool xqa_g6_p1024_sawtooth_enabled() {
 
 bool xqa_e4m3_g6_p64_p256_auto_enabled() {
   const char* value = std::getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO");
-  return value != nullptr && value[0] == '1';
+  return value == nullptr || value[0] != '0';
 }
 
 bool xqa_e4m3_g6_p64_p256_auto_trace_enabled() {
@@ -297,13 +301,13 @@ int xqa_e4m3_g6_dual_cta_begin() {
 bool xqa_e4m3_g6_wave_partitions_enabled() {
   const char* value =
       std::getenv("VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS");
-  return value != nullptr && value[0] == '1';
+  return value == nullptr || value[0] != '0';
 }
 
 bool xqa_e4m3_g6_merged_wave_launch_enabled() {
   const char* value =
       std::getenv("VLLM_FLASH_V100_XQA_E4M3_G6_MERGED_WAVE_LAUNCH");
-  return value != nullptr && value[0] == '1';
+  return value == nullptr || value[0] != '0';
 }
 
 int xqa_e4m3_g6_p512_begin() {
@@ -765,7 +769,10 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
     logical_block = token_offset / 784;
     block_offset = token_offset - logical_block * 784;
   } else if constexpr (BLOCK_SIZE == 800) {
-    logical_block = token_offset >= 800;
+    // E4M3 long-wave partitions can span four 800-token pages. Keep the
+    // constant-page specialization division-free without truncating at page 1.
+    logical_block =
+        (token_offset >= 800) + (token_offset >= 1600) + (token_offset >= 2400);
     block_offset = token_offset - logical_block * 800;
   } else if constexpr (BLOCK_SIZE == 1568) {
     logical_block = token_offset / 1568;
@@ -856,7 +863,8 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
         logical_block = token_offset / 784;
         block_offset = token_offset - logical_block * 784;
       } else if constexpr (BLOCK_SIZE == 800) {
-        logical_block = token_offset >= 800;
+        logical_block = (token_offset >= 800) + (token_offset >= 1600) +
+                        (token_offset >= 2400);
         block_offset = token_offset - logical_block * 800;
       } else if constexpr (BLOCK_SIZE == 1568) {
         logical_block = token_offset / 1568;
@@ -987,7 +995,7 @@ __device__ __forceinline__ float dot_qk_half2(const __half* __restrict__ q_ptr,
   return warp_reduce_sum(acc);
 }
 
-template <int D, int KV_DTYPE>
+template <int D, int KV_DTYPE, bool E4M3_BITS = false>
 __device__ __forceinline__ float dot_qk_cache(const __half* __restrict__ q_ptr,
                                               const void* __restrict__ k_cache,
                                               const int64_t k_index_base,
@@ -1015,8 +1023,9 @@ __device__ __forceinline__ float dot_qk_cache(const __half* __restrict__ q_ptr,
 #pragma unroll
     for (int d = lane; d < D; d += kWarpSize) {
       const float qv = __half2float(q_ptr[d]);
-      const float kv = flash_v100::load_kv_cache_float_unscaled<KV_DTYPE>(
-          k_cache, k_index_base + d);
+      const float kv =
+          flash_v100::load_kv_cache_float_unscaled<KV_DTYPE, E4M3_BITS>(
+              k_cache, k_index_base + d);
       acc = fmaf(qv, kv, acc);
     }
     return warp_reduce_sum(acc);
@@ -1024,10 +1033,11 @@ __device__ __forceinline__ float dot_qk_cache(const __half* __restrict__ q_ptr,
 }
 
 template <int D, int PARTITION_SIZE, int KV_DTYPE,
-          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens, bool ANCHORED_SWA = false>
+          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens, bool ANCHORED_SWA = false,
+          typename PARTIAL_T = __half, bool TP2_E4M3_FAST = false>
 __global__ void flash_attention_decode_partition_kernel(
     const __half* __restrict__ q, const void* __restrict__ k_cache,
-    const void* __restrict__ v_cache, __half* __restrict__ tmp_out,
+    const void* __restrict__ v_cache, PARTIAL_T* __restrict__ tmp_out,
     float* __restrict__ max_logits, float* __restrict__ exp_sums,
     const int* __restrict__ block_table, const int* __restrict__ seq_lens,
     const int* __restrict__ active_num_partitions, const int batch_size,
@@ -1152,7 +1162,8 @@ __global__ void flash_attention_decode_partition_kernel(
         static_cast<int64_t>(block_offset) * k_token_stride +
         static_cast<int64_t>(kv_head_idx) * k_head_stride;
 
-    float score = dot_qk_cache<D, KV_DTYPE>(q_shared, k_cache, k_index, lane);
+    float score = dot_qk_cache<D, KV_DTYPE, TP2_E4M3_FAST>(q_shared, k_cache,
+                                                           k_index, lane);
     if (lane == 0) {
       if constexpr (ANCHORED_SWA) {
         const int token_idx = part_start + token_local;
@@ -1194,21 +1205,42 @@ __global__ void flash_attention_decode_partition_kernel(
 
   for (int d = threadIdx.x; d < D; d += blockDim.x) {
     float acc = 0.f;
-    for (int i = 0; i < part_tokens; ++i) {
-      const int physical_block = block_idx_shared[i];
-      const int block_offset = block_offset_shared[i];
-      const int64_t v_index =
-          static_cast<int64_t>(physical_block) * v_block_stride +
-          static_cast<int64_t>(block_offset) * v_token_stride +
-          static_cast<int64_t>(kv_head_idx) * v_head_stride + d;
-      const float vv =
-          flash_v100::load_kv_cache_float_unscaled<KV_DTYPE>(v_cache, v_index);
-      acc = fmaf(scores_shared[i], vv, acc);
+    if constexpr (TP2_E4M3_FAST) {
+      // Expose independent loads while retaining the ascending-token FMA chain.
+#pragma unroll 8
+      for (int i = 0; i < part_tokens; ++i) {
+        const int physical_block = block_idx_shared[i];
+        const int block_offset = block_offset_shared[i];
+        const int64_t v_index =
+            static_cast<int64_t>(physical_block) * v_block_stride +
+            static_cast<int64_t>(block_offset) * v_token_stride +
+            static_cast<int64_t>(kv_head_idx) * v_head_stride + d;
+        const float vv =
+            flash_v100::load_kv_cache_float_unscaled<KV_DTYPE, true>(v_cache,
+                                                                     v_index);
+        acc = fmaf(scores_shared[i], vv, acc);
+      }
+    } else {
+      for (int i = 0; i < part_tokens; ++i) {
+        const int physical_block = block_idx_shared[i];
+        const int block_offset = block_offset_shared[i];
+        const int64_t v_index =
+            static_cast<int64_t>(physical_block) * v_block_stride +
+            static_cast<int64_t>(block_offset) * v_token_stride +
+            static_cast<int64_t>(kv_head_idx) * v_head_stride + d;
+        const float vv = flash_v100::load_kv_cache_float_unscaled<KV_DTYPE>(
+            v_cache, v_index);
+        acc = fmaf(scores_shared[i], vv, acc);
+      }
     }
     const float out_scale = KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16
                                 ? inv_part_sum
                                 : inv_part_sum * v_scale;
-    tmp_out[tmp_out_base + d] = __float2half(acc * out_scale);
+    if constexpr (std::is_same_v<PARTIAL_T, float>) {
+      tmp_out[tmp_out_base + d] = acc * out_scale;
+    } else {
+      tmp_out[tmp_out_base + d] = __float2half(acc * out_scale);
+    }
   }
 
   if (threadIdx.x == 0) {
@@ -1225,11 +1257,11 @@ template <int PARTITION_SIZE, int GROUP_SIZE, bool PADDED_SMEM, int NUM_THREADS,
           bool ALIGNED_PADDED_SMEM, int KV_DTYPE,
           int SEQ_LEN_ROUTE = kXQARouteAllSeqLens, bool QK_SW_PIPELINE = false,
           bool PARTITION_PAGE_IDS = false, bool FP8_PAIR_LOAD = false,
-          bool E4M3_SHARED_LUT = false>
+          bool E4M3_SHARED_LUT = false, typename PARTIAL_T = __half>
 __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
     flash_attention_decode_xqa_tc_partition_kernel_256_wide(
         const __half* __restrict__ q, const void* __restrict__ k_cache,
-        const void* __restrict__ v_cache, __half* __restrict__ tmp_out,
+        const void* __restrict__ v_cache, PARTIAL_T* __restrict__ tmp_out,
         float* __restrict__ max_logits, float* __restrict__ exp_sums,
         const int* __restrict__ block_table, const int* __restrict__ seq_lens,
         const int* __restrict__ active_num_partitions, const int batch_size,
@@ -1257,10 +1289,10 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
       QK_SW_PIPELINE,
       XQATCQKPipelineSmem256WideLayout<PADDED_SMEM, ALIGNED_PADDED_SMEM>,
       XQATCSmem256WideLayout<PADDED_SMEM, ALIGNED_PADDED_SMEM>>;
-  // Keep softmax P in fp32 through PV for fp16 KV, avoiding a half round-trip.
-  // Preserve the half-P path for fp8_e5m2 so quantized-cache behavior remains
-  // bit-exact. This branch is resolved entirely at compile time.
-  constexpr bool kKeepPfp32 = (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16);
+  // Keep softmax P in fp32 through PV for FP16 and E4M3 KV, avoiding a half
+  // round-trip before the existing fp32 FMA accumulation. Preserve E5M2's
+  // established half-P numerical contract. This branch is compile-time only.
+  constexpr bool kKeepPfp32 = KV_DTYPE != flash_v100::KV_CACHE_DTYPE_FP8_E5M2;
   constexpr int q_global_stride_uint4 = D / 8;
   constexpr int q_smem_stride_uint4 = SmemLayout::kQStride / 8;
   constexpr int kv_smem_stride_uint4 = SmemLayout::kKVStride / 8;
@@ -1388,7 +1420,7 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
     if constexpr (BLOCK_SIZE == 800) {
       partition_start_page = start_token_idx / 800;
       partition_page_offset = start_token_idx - partition_start_page * 800;
-      partition_page_count = 1 + (partition_page_offset + part_tokens > 800);
+      partition_page_count = (partition_page_offset + part_tokens + 799) / 800;
     } else {
       partition_start_page = start_token_idx / block_size;
       partition_page_offset =
@@ -1738,10 +1770,10 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
     const int head_idx = q_head_base + row;
     const float row_sum = smem.row_sum[row];
     const float inv_row_sum = row_sum > 0.f ? 1.f / row_sum : 0.f;
-    __half* tmp_out_ptr = tmp_out +
-                          static_cast<int64_t>(batch_idx) * tmp_out_stride0 +
-                          static_cast<int64_t>(head_idx) * tmp_out_stride1 +
-                          static_cast<int64_t>(partition_idx) * tmp_out_stride2;
+    PARTIAL_T* tmp_out_ptr =
+        tmp_out + static_cast<int64_t>(batch_idx) * tmp_out_stride0 +
+        static_cast<int64_t>(head_idx) * tmp_out_stride1 +
+        static_cast<int64_t>(partition_idx) * tmp_out_stride2;
     const float output_scale = KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16
                                    ? inv_row_sum
                                    : inv_row_sum * v_scale;
@@ -1755,11 +1787,21 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
         const int component = panel_acc_idx & 1;
         const int d = panel_idx * kPVPanelDim + d_iter * (2 * kWarpSize) +
                       thread_in_row * 2 + component;
-        tmp_out_ptr[d] = __float2half(out_acc[acc_idx] * output_scale);
+        const float value = out_acc[acc_idx] * output_scale;
+        if constexpr (std::is_same_v<PARTIAL_T, float>) {
+          tmp_out_ptr[d] = value;
+        } else {
+          tmp_out_ptr[d] = __float2half(value);
+        }
       }
     } else {
       for (int d = thread_in_row; d < D; d += kXQATC256WideThreadsPerRow) {
-        tmp_out_ptr[d] = __float2half(out_acc[d / kWarpSize] * output_scale);
+        const float value = out_acc[d / kWarpSize] * output_scale;
+        if constexpr (std::is_same_v<PARTIAL_T, float>) {
+          tmp_out_ptr[d] = value;
+        } else {
+          tmp_out_ptr[d] = __float2half(value);
+        }
       }
     }
     if (thread_in_row == 0) {
@@ -1879,6 +1921,7 @@ __device__ __forceinline__ int grouped_verify_active_splits(
   return total_kv <= kGroupedVerifyShortContextMaxTokens ? 1 : active_splits;
 }
 
+template <bool COMPENSATE = false>
 __device__ __forceinline__ void grouped_verify_qk(
     const __half* __restrict__ shared_q, const __half* __restrict__ shared_k,
     float* __restrict__ shared_scores, const float qk_scale,
@@ -1899,6 +1942,7 @@ __device__ __forceinline__ void grouped_verify_qk(
       k_fragment;
   volta::fragment<volta::accumulator, 16, 16, 16, float> score_fragment;
   volta::fill_fragment(score_fragment, 0.0f);
+  float correction[8] = {};
 
 #pragma unroll
   for (int k_offset = 0; k_offset < kGroupedVerifyHeadDim; k_offset += 16) {
@@ -1910,7 +1954,24 @@ __device__ __forceinline__ void grouped_verify_qk(
     volta::load_matrix_sync(
         k_fragment, shared_k + n_tile * 16 * kGroupedVerifyKVStride + k_offset,
         kGroupedVerifyKVStride);
-    volta::mma_sync(score_fragment, q_fragment, k_fragment, score_fragment);
+    if constexpr (COMPENSATE) {
+      // E4M3 x FP16 products fit comfortably in FP32, but a D256 Tensor
+      // Core accumulation can still lose low bits. Sum short K16 products
+      // with compensated FP32 additions; explicit RN operations preserve
+      // the correction under the standard fast-math build.
+      volta::fragment<volta::accumulator, 16, 16, 16, float> tile_fragment;
+      volta::fill_fragment(tile_fragment, 0.0f);
+      volta::mma_sync(tile_fragment, q_fragment, k_fragment, tile_fragment);
+#pragma unroll
+      for (int i = 0; i < score_fragment.num_elements; ++i) {
+        const float y = __fsub_rn(tile_fragment.x[i], correction[i]);
+        const float sum = __fadd_rn(score_fragment.x[i], y);
+        correction[i] = __fsub_rn(__fsub_rn(sum, score_fragment.x[i]), y);
+        score_fragment.x[i] = sum;
+      }
+    } else {
+      volta::mma_sync(score_fragment, q_fragment, k_fragment, score_fragment);
+    }
   }
 #pragma unroll
   for (int i = 0; i < score_fragment.num_elements; ++i) {
@@ -1938,11 +1999,27 @@ __device__ __forceinline__ void grouped_verify_scale_output_fragment(
   fragment.x[7] *= second_scale;
 }
 
-template <bool SPARSE_PAGE4>
+__device__ __forceinline__ void grouped_verify_add_output_tile(
+    volta::fragment<volta::accumulator, 16, 16, 16, float>& output,
+    const volta::fragment<volta::accumulator, 16, 16, 16, float>& tile,
+    const float* row_scale, const int tile_row_start) {
+  const int lane = threadIdx.x & 31;
+  const int row = (lane & 1) + ((lane >> 2) & 1) * 8 + ((lane >> 4) & 1) * 4;
+  const float first_scale = row_scale[tile_row_start + row];
+  const float second_scale = row_scale[tile_row_start + row + 2];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const float scale = (i & 2) ? second_scale : first_scale;
+    output.x[i] = fmaf(output.x[i], scale, tile.x[i]);
+  }
+}
+
+template <bool SPARSE_PAGE4, bool ROW_SEQLENS = false>
 __device__ __forceinline__ bool grouped_verify_key_visible(
     const uint32_t* __restrict__ sparse_tile_masks, const int token_idx,
     const int query_len, const int head_idx, const int kv_idx,
-    const int valid_k_rows, const int lane_or_col, const int prefix_kv_len) {
+    const int valid_k_rows, const int lane_or_col, const int prefix_kv_len,
+    const int* row_lengths = nullptr) {
   const bool row_valid = token_idx < query_len &&
                          head_idx < kGroupedVerifyHeads &&
                          lane_or_col < valid_k_rows;
@@ -1955,6 +2032,9 @@ __device__ __forceinline__ bool grouped_verify_key_visible(
     const int mask_bit = token_idx * 4 + (kv_idx & 3);
     return (token_mask & (1u << mask_bit)) != 0;
   }
+  if constexpr (ROW_SEQLENS) {
+    return kv_idx < row_lengths[token_idx];
+  }
   return kv_idx <= prefix_kv_len + token_idx;
 }
 
@@ -1962,12 +2042,13 @@ template <int MAX_QUERY_TOKENS, bool TWO_PASS, int PAGE_BLOCK_SIZE = 0,
           bool SINGLE_QUERY = false, bool CONTIGUOUS_HKV1_LAYOUT = false,
           bool STAGE_PARTITION_PAGE_IDS = false,
           int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
-          bool SPARSE_PAGE4 = false>
+          bool SPARSE_PAGE4 = false, typename PARTIAL_T = __half,
+          bool ROW_SEQLENS = false, bool COMPENSATE_P = false>
 __global__
 __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_e5m2_partial_kernel(
     const __half* __restrict__ q, const void* __restrict__ k_cache,
     const void* __restrict__ v_cache, const int* __restrict__ block_table,
-    const int* __restrict__ seq_lens, __half* __restrict__ partial_out,
+    const int* __restrict__ seq_lens, PARTIAL_T* __restrict__ partial_out,
     float* __restrict__ partial_lse, const int query_len,
     const int max_num_blocks, const int page_block_size,
     const int64_t k_block_stride, const int64_t k_token_stride,
@@ -1975,18 +2056,38 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     const int64_t v_token_stride, const int64_t v_head_stride,
     const float qk_scale, const float v_scale,
     const uint32_t* __restrict__ sparse_token_masks = nullptr,
-    const int num_groups = 1) {
+    const int num_groups = 1, const int* row_lengths = nullptr) {
+  static_assert(!ROW_SEQLENS || !SPARSE_PAGE4,
+                "explicit row lengths apply to dense causal groups only");
+  static_assert(
+      !COMPENSATE_P || (!TWO_PASS && ROW_SEQLENS &&
+                        KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
+                        std::is_same_v<PARTIAL_T, float>),
+      "probability compensation is isolated to E4M3 FP32 groups");
   using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;
   const int head_group = blockIdx.x;
   const int split_id = blockIdx.y;
-  const int group_idx = SPARSE_PAGE4 ? blockIdx.z : 0;
+  const int group_idx = blockIdx.z;
   if (head_group >= Traits::kHeadGroups || split_id >= Traits::kSplits ||
       group_idx >= num_groups || query_len <= 0 ||
       query_len > MAX_QUERY_TOKENS) {
     return;
   }
 
-  const int total_kv = seq_lens[SPARSE_PAGE4 ? group_idx : 0];
+  if constexpr (!SPARSE_PAGE4) {
+    partial_out += static_cast<int64_t>(group_idx) * Traits::kSplits *
+                   MAX_QUERY_TOKENS * kGroupedVerifyHeads *
+                   kGroupedVerifyHeadDim;
+    partial_lse += static_cast<int64_t>(group_idx) * Traits::kSplits *
+                   MAX_QUERY_TOKENS * kGroupedVerifyHeads;
+  }
+
+  int total_kv = seq_lens[group_idx];
+  if constexpr (ROW_SEQLENS) {
+    total_kv = 0;
+    for (int i = 0; i < query_len; ++i)
+      total_kv = max(total_kv, row_lengths[i]);
+  }
   if (total_kv <= 0) {
     if constexpr (SPARSE_PAGE4) {
       constexpr int kGroupOutputElements =
@@ -2037,6 +2138,12 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
   __half* shared_kv = smem.storage.compute.kv;
   float* shared_scores = smem.storage.compute.scores;
   __half* shared_probs = smem.storage.compute.probs;
+  // The compensated entry reserves one padded probability panel after the
+  // legacy layout. Match P's shared-memory stride without aliasing live QK
+  // rows. Legacy entries retain their existing shared-memory footprint.
+  __half* shared_prob_residual = reinterpret_cast<__half*>(
+      grouped_verify_smem_raw + sizeof(GroupedVerifySmem));
+  constexpr int kResidualStride = kGroupedVerifyProbStride;
   const int* page_ids =
       block_table + static_cast<int64_t>(group_idx) * max_num_blocks;
   int split_page_offset = 0;
@@ -2053,7 +2160,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     if (use_staged_page_ids) {
       for (int idx = tid; idx < split_page_count;
            idx += kGroupedVerifyThreads) {
-        smem.page_ids[idx] = __ldg(&block_table[split_start_page + idx]);
+        smem.page_ids[idx] = __ldg(&page_ids[split_start_page + idx]);
       }
     }
     if (use_staged_page_ids) {
@@ -2124,7 +2231,10 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                               : tile_start;
       load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,
                            kGroupedVerifyThreads, KV_DTYPE,
-                           KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2>(
+                           KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
+                               (KV_DTYPE ==
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
+                                !SPARSE_PAGE4 && !ROW_SEQLENS)>(
           shared_kv, k_cache, page_ids, valid_k_rows, kPanelStrideVec,
           kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
           k_block_stride, k_token_stride, k_head_stride, 0);
@@ -2164,9 +2274,10 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
         const int local_head = row % Traits::kHeadsPerCta;
         const int head_idx = head_start + local_head;
         const int kv_idx = tile_start + lane_id;
-        const bool visible = grouped_verify_key_visible<SPARSE_PAGE4>(
-            smem.sparse_token_masks, token_idx, query_len, head_idx, kv_idx,
-            valid_k_rows, lane_id, prefix_kv_len);
+        const bool visible =
+            grouped_verify_key_visible<SPARSE_PAGE4, ROW_SEQLENS>(
+                smem.sparse_token_masks, token_idx, query_len, head_idx, kv_idx,
+                valid_k_rows, lane_id, prefix_kv_len, row_lengths);
         const float score =
             visible ? shared_scores[row * kGroupedVerifyScoreStride + lane_id]
                     : kXQANegInf;
@@ -2212,7 +2323,9 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                             : tile_start;
     load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,
                          kGroupedVerifyThreads, KV_DTYPE,
-                         KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2>(
+                         KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
+                             (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
+                              !SPARSE_PAGE4 && !ROW_SEQLENS)>(
         shared_kv, k_cache, page_ids, valid_k_rows, kPanelStrideVec,
         kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
         k_block_stride, k_token_stride, k_head_stride, 0);
@@ -2224,6 +2337,13 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     __syncthreads();
 
     int active_m_tiles = 0x7;
+    if constexpr (COMPENSATE_P) {
+      // Native MTP4 supplies five rows: only 30 of the 48 packed rows are
+      // live. Avoid QK/PV for wholly padded M tiles to pay for the residual
+      // product without changing arithmetic in any live row.
+      active_m_tiles =
+          (1 << ((query_len * Traits::kHeadsPerCta + 15) / 16)) - 1;
+    }
     if constexpr (SPARSE_PAGE4) {
       uint32_t active_query_nibbles = 0;
 #pragma unroll
@@ -2241,8 +2361,8 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
         }
       }
     }
-    grouped_verify_qk(shared_q, shared_kv, shared_scores, qk_scale,
-                      active_m_tiles);
+    grouped_verify_qk<COMPENSATE_P>(shared_q, shared_kv, shared_scores,
+                                    qk_scale, active_m_tiles);
     __syncthreads();
 
     if constexpr (TWO_PASS) {
@@ -2255,9 +2375,9 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
         const int head_idx = head_start + local_head;
         const int kv_idx = tile_start + col;
         const bool visible =
-            grouped_verify_key_visible<SPARSE_PAGE4>(
+            grouped_verify_key_visible<SPARSE_PAGE4, ROW_SEQLENS>(
                 smem.sparse_token_masks, token_idx, query_len, head_idx, kv_idx,
-                valid_k_rows, col, prefix_kv_len) &&
+                valid_k_rows, col, prefix_kv_len, row_lengths) &&
             smem.row_sum[row] > 0.0f;
         const float probability =
             visible ? __expf(fmaxf(
@@ -2273,13 +2393,19 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
 #pragma unroll
       for (int row = warp_id; row < kGroupedVerifyRows;
            row += kGroupedVerifyWarps) {
+        if constexpr (COMPENSATE_P) {
+          if ((active_m_tiles & (1 << (row / 16))) == 0) {
+            continue;
+          }
+        }
         const int token_idx = row / Traits::kHeadsPerCta;
         const int local_head = row % Traits::kHeadsPerCta;
         const int head_idx = head_start + local_head;
         const int kv_idx = tile_start + lane_id;
-        const bool visible = grouped_verify_key_visible<SPARSE_PAGE4>(
-            smem.sparse_token_masks, token_idx, query_len, head_idx, kv_idx,
-            valid_k_rows, lane_id, prefix_kv_len);
+        const bool visible =
+            grouped_verify_key_visible<SPARSE_PAGE4, ROW_SEQLENS>(
+                smem.sparse_token_masks, token_idx, query_len, head_idx, kv_idx,
+                valid_k_rows, lane_id, prefix_kv_len, row_lengths);
         const float score =
             visible ? shared_scores[row * kGroupedVerifyScoreStride + lane_id]
                     : kXQANegInf;
@@ -2295,6 +2421,14 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
             tile_sum > 0.0f ? __expf(fmaxf(old_max - new_max, -80.0f)) : 1.0f;
         shared_probs[row * kGroupedVerifyProbStride + lane_id] =
             __float2half_rn(probability);
+        if constexpr (COMPENSATE_P) {
+          const float rounded = __half2float(__float2half_rn(probability));
+          shared_prob_residual[row * kResidualStride + lane_id] =
+              __float2half_rn((probability - rounded) * 2048.0f);
+        }
+        // Finish every lane's shared-state reads before lane 0 overwrites the
+        // online maximum. Shuffle synchronization does not order memory.
+        __syncwarp();
         if (lane_id == 0) {
           if (tile_sum > 0.0f) {
             smem.row_sum[row] = smem.row_sum[row] * exp_diff + tile_sum;
@@ -2304,19 +2438,23 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
         }
       }
       __syncthreads();
+      if constexpr (!COMPENSATE_P) {
 #pragma unroll
-      for (int fragment_idx = 0;
-           fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
-        const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
-        const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
-        grouped_verify_scale_output_fragment(output_fragments[fragment_idx],
-                                             smem.row_scale, m_tile * 16);
+        for (int fragment_idx = 0;
+             fragment_idx < kGroupedVerifyOutputTilesPerWarp; ++fragment_idx) {
+          const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
+          const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
+          grouped_verify_scale_output_fragment(output_fragments[fragment_idx],
+                                               smem.row_scale, m_tile * 16);
+        }
       }
     }
 
     load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,
                          kGroupedVerifyThreads, KV_DTYPE,
-                         KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2>(
+                         KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
+                             (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
+                              !SPARSE_PAGE4 && !ROW_SEQLENS)>(
         shared_kv, v_cache, page_ids, valid_k_rows, kPanelStrideVec,
         kSharedStrideVec, tile_page_offset, 0, page_block_size, 0,
         v_block_stride, v_token_stride, v_head_stride, 0);
@@ -2333,7 +2471,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
       const int output_tile = warp_id + fragment_idx * kGroupedVerifyWarps;
       const int m_tile = output_tile / (kGroupedVerifyHeadDim / 16);
       const int d_tile = output_tile % (kGroupedVerifyHeadDim / 16);
-      if constexpr (SPARSE_PAGE4) {
+      if constexpr (SPARSE_PAGE4 || COMPENSATE_P) {
         if ((active_m_tiles & (1 << m_tile)) == 0) {
           continue;
         }
@@ -2342,6 +2480,15 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
           probability_fragment;
       volta::fragment<volta::matrix_b, 16, 16, 16, half, volta::row_major>
           value_fragment;
+      volta::fragment<volta::accumulator, 16, 16, 16, float> tile_fragment;
+      if constexpr (COMPENSATE_P) {
+        // Keep Tensor Core accumulation local to N32. Carrying a large C
+        // through every KV tile loses small PV corrections at long contexts.
+        // The online state remains FP32 and is updated once per tile below.
+        volta::fill_fragment(tile_fragment, 0.0f);
+      }
+      auto& pv_fragment =
+          COMPENSATE_P ? tile_fragment : output_fragments[fragment_idx];
 #pragma unroll
       for (int k_offset = 0; k_offset < kGroupedVerifyBlockN; k_offset += 16) {
         volta::load_matrix_sync(
@@ -2352,8 +2499,36 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
             value_fragment,
             shared_kv + k_offset * kGroupedVerifyKVStride + d_tile * 16,
             kGroupedVerifyKVStride);
-        volta::mma_sync(output_fragments[fragment_idx], probability_fragment,
-                        value_fragment, output_fragments[fragment_idx]);
+        volta::mma_sync(pv_fragment, probability_fragment, value_fragment,
+                        pv_fragment);
+        if constexpr (COMPENSATE_P) {
+          // Scale the residual up before its FP16 conversion so small
+          // corrections do not underflow. Every finite E4M3 value divided
+          // by 2048 is still exactly representable in FP16, so applying
+          // the inverse power of two to V introduces no operand rounding.
+          volta::load_matrix_sync(
+              probability_fragment,
+              shared_prob_residual + m_tile * 16 * kResidualStride + k_offset,
+              kResidualStride);
+#pragma unroll
+          for (int i = 0; i < value_fragment.num_elements / 2; ++i) {
+            union {
+              uint32_t bits;
+              __half2 pair;
+            } packed_value;
+            packed_value.bits = value_fragment.x[i];
+            packed_value.pair =
+                __hmul2(packed_value.pair, __float2half2_rn(1.0f / 2048.0f));
+            value_fragment.x[i] = packed_value.bits;
+          }
+          volta::mma_sync(pv_fragment, probability_fragment, value_fragment,
+                          pv_fragment);
+        }
+      }
+      if constexpr (COMPENSATE_P) {
+        grouped_verify_add_output_tile(output_fragments[fragment_idx],
+                                       tile_fragment, smem.row_scale,
+                                       m_tile * 16);
       }
     }
     __syncthreads();
@@ -2385,7 +2560,11 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     const int head_idx = head_start + local_head;
     if (token_idx < query_len && head_idx < kGroupedVerifyHeads) {
       const float sum = smem.row_sum[row];
-      const float scale = sum > 0.0f ? v_scale / sum : 0.0f;
+      // Explicit-row FP32 groups retain the numerator until the final merge.
+      // Normalizing each partition and encoding its weight as m+log(sum)
+      // introduces avoidable rounding, including at FP16 output midpoints.
+      const float scale =
+          sum > 0.0f ? (ROW_SEQLENS ? v_scale : v_scale / sum) : 0.0f;
       int64_t output_idx;
       if constexpr (SPARSE_PAGE4) {
         const int64_t global_token_idx =
@@ -2401,7 +2580,11 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                  kGroupedVerifyHeadDim +
              d);
       }
-      partial_out[output_idx] = __float2half_rn(shared_output[idx] * scale);
+      if constexpr (std::is_same_v<PARTIAL_T, float>) {
+        partial_out[output_idx] = shared_output[idx] * scale;
+      } else {
+        partial_out[output_idx] = __float2half_rn(shared_output[idx] * scale);
+      }
     }
   }
   if (tid < kGroupedVerifyRows) {
@@ -2421,27 +2604,58 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                 kGroupedVerifyHeads +
             head_idx;
       }
-      partial_lse[lse_idx] =
-          sum > 0.0f ? smem.row_max[tid] + logf(sum) : kXQANegInf;
+      if constexpr (ROW_SEQLENS) {
+        partial_lse[2 * lse_idx] = sum > 0.0f ? smem.row_max[tid] : kXQANegInf;
+        partial_lse[2 * lse_idx + 1] = sum;
+      } else {
+        partial_lse[lse_idx] =
+            sum > 0.0f ? smem.row_max[tid] + logf(sum) : kXQANegInf;
+      }
     }
   }
 }
 
-template <int MAX_QUERY_TOKENS, bool SINGLE_QUERY>
+template <int MAX_QUERY_TOKENS, bool SINGLE_QUERY, typename PARTIAL_T = __half,
+          bool ROW_SEQLENS = false>
 __global__
 __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m2_combine_kernel(
-    const __half* __restrict__ partial_out,
+    const PARTIAL_T* __restrict__ partial_out,
     const float* __restrict__ partial_lse, const int* __restrict__ seq_lens,
-    __half* __restrict__ out, const int query_len) {
+    __half* __restrict__ out, const int query_len,
+    const int* row_lengths = nullptr) {
   using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;
   const int token_idx = blockIdx.x;
   const int head_idx = blockIdx.y;
+  const int request_idx = blockIdx.z;
   if (token_idx >= query_len || head_idx >= kGroupedVerifyHeads) {
     return;
   }
+  partial_out += static_cast<int64_t>(request_idx) * Traits::kSplits *
+                 MAX_QUERY_TOKENS * kGroupedVerifyHeads * kGroupedVerifyHeadDim;
+  partial_lse += static_cast<int64_t>(request_idx) * Traits::kSplits *
+                 MAX_QUERY_TOKENS * kGroupedVerifyHeads;
+  seq_lens += request_idx;
+  out += static_cast<int64_t>(request_idx) * query_len * kGroupedVerifyHeads *
+         kGroupedVerifyHeadDim;
+
+  int total_kv = seq_lens[0];
+  if constexpr (ROW_SEQLENS) {
+    total_kv = 0;
+    for (int i = 0; i < query_len; ++i)
+      total_kv = max(total_kv, row_lengths[i]);
+    // Padding may leave every partial unwritten. Never read stale workspace.
+    if (row_lengths[token_idx] <= 0) {
+      for (int d = threadIdx.x; d < kGroupedVerifyHeadDim; d += blockDim.x)
+        out[(token_idx * kGroupedVerifyHeads + head_idx) *
+                kGroupedVerifyHeadDim +
+            d] = __float2half_rn(0.0f);
+      return;
+    }
+  }
   const int active_splits =
-      grouped_verify_active_splits<MAX_QUERY_TOKENS, SINGLE_QUERY>(seq_lens[0]);
+      grouped_verify_active_splits<MAX_QUERY_TOKENS, SINGLE_QUERY>(total_kv);
   __shared__ float split_lse[Traits::kSplits];
+  __shared__ float split_sum[ROW_SEQLENS ? Traits::kSplits : 1];
   __shared__ float final_max;
   __shared__ float final_inv_sum;
 
@@ -2450,8 +2664,15 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
         (static_cast<int64_t>(threadIdx.x) * MAX_QUERY_TOKENS + token_idx) *
             kGroupedVerifyHeads +
         head_idx;
-    split_lse[threadIdx.x] =
-        threadIdx.x < active_splits ? partial_lse[lse_idx] : kXQANegInf;
+    if constexpr (ROW_SEQLENS) {
+      split_lse[threadIdx.x] =
+          threadIdx.x < active_splits ? partial_lse[2 * lse_idx] : kXQANegInf;
+      split_sum[threadIdx.x] =
+          threadIdx.x < active_splits ? partial_lse[2 * lse_idx + 1] : 0.0f;
+    } else {
+      split_lse[threadIdx.x] =
+          threadIdx.x < active_splits ? partial_lse[lse_idx] : kXQANegInf;
+    }
   }
   __syncthreads();
 
@@ -2463,7 +2684,12 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
     float sum = 0.0f;
     for (int split = 0; split < active_splits; ++split) {
       if (split_lse[split] > -1.0e20f) {
-        sum += __expf(fmaxf(split_lse[split] - max_lse, -80.0f));
+        const float weight = __expf(fmaxf(split_lse[split] - max_lse, -80.0f));
+        if constexpr (ROW_SEQLENS) {
+          sum = fmaf(weight, split_sum[split], sum);
+        } else {
+          sum += weight;
+        }
       }
     }
     final_max = max_lse;
@@ -2484,8 +2710,12 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
               head_idx) *
                  kGroupedVerifyHeadDim +
              d);
-        accumulator =
-            fmaf(weight, __half2float(partial_out[partial_idx]), accumulator);
+        if constexpr (std::is_same_v<PARTIAL_T, float>) {
+          accumulator = fmaf(weight, partial_out[partial_idx], accumulator);
+        } else {
+          accumulator =
+              fmaf(weight, __half2float(partial_out[partial_idx]), accumulator);
+        }
       }
     }
     out[(token_idx * kGroupedVerifyHeads + head_idx) * kGroupedVerifyHeadDim +
@@ -2493,9 +2723,10 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
   }
 }
 
-template <int D, int PARTITION_SIZE, int SEQ_LEN_ROUTE = kXQARouteAllSeqLens>
+template <int D, int PARTITION_SIZE, int SEQ_LEN_ROUTE = kXQARouteAllSeqLens,
+          typename PARTIAL_T = __half>
 __global__ void flash_attention_decode_reduce_kernel(
-    const __half* __restrict__ tmp_out, const float* __restrict__ max_logits,
+    const PARTIAL_T* __restrict__ tmp_out, const float* __restrict__ max_logits,
     const float* __restrict__ exp_sums, const int* __restrict__ seq_lens,
     const int* __restrict__ active_num_partitions, __half* __restrict__ out,
     const int batch_size, const int max_num_partitions, const int num_heads_q,
@@ -2580,11 +2811,11 @@ __global__ void flash_attention_decode_reduce_kernel(
   for (int d = threadIdx.x; d < D; d += blockDim.x) {
     float acc = 0.f;
     for (int i = 0; i < num_partitions; ++i) {
-      acc = fmaf(
-          weight_shared[i],
-          __half2float(tmp_out[tmp_out_base +
-                               static_cast<int64_t>(i) * tmp_out_stride2 + d]),
-          acc);
+      acc = fmaf(weight_shared[i],
+                 static_cast<float>(
+                     tmp_out[tmp_out_base +
+                             static_cast<int64_t>(i) * tmp_out_stride2 + d]),
+                 acc);
     }
     out[out_base + d] = __float2half(acc * inv_global_sum);
   }
@@ -3117,9 +3348,9 @@ __global__ void flash_attention_decode_xqa_reduce_stats_kernel(
 }
 
 template <int D, int PARTITION_SIZE, int D_TILE,
-          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens>
+          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens, typename PARTIAL_T = __half>
 __global__ void flash_attention_decode_xqa_reduce_output_kernel(
-    const __half* __restrict__ tmp_out, const float* __restrict__ weights,
+    const PARTIAL_T* __restrict__ tmp_out, const float* __restrict__ weights,
     const float* __restrict__ global_sums, const int* __restrict__ seq_lens,
     __half* __restrict__ out, const int batch_size,
     const int max_num_partitions, const int num_heads_q,
@@ -3167,11 +3398,11 @@ __global__ void flash_attention_decode_xqa_reduce_output_kernel(
 
   float acc = 0.f;
   for (int i = 0; i < num_partitions; ++i) {
-    acc = fmaf(
-        weights[stats_base + i],
-        __half2float(tmp_out[tmp_out_base +
-                             static_cast<int64_t>(i) * tmp_out_stride2 + d]),
-        acc);
+    acc = fmaf(weights[stats_base + i],
+               static_cast<float>(
+                   tmp_out[tmp_out_base +
+                           static_cast<int64_t>(i) * tmp_out_stride2 + d]),
+               acc);
   }
   out[out_index] = __float2half(acc * inv_global_sum);
 }
@@ -3250,7 +3481,7 @@ __global__ void flash_attention_decode_qk_scores_kernel(
 }
 
 template <int D, int PARTITION_SIZE, int KV_DTYPE,
-          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens>
+          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens, typename PARTIAL_T = __half>
 void launch_flash_attention_decode_paged(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     at::Tensor& out, const at::Tensor& block_table, const at::Tensor& seq_lens,
@@ -3279,14 +3510,15 @@ void launch_flash_attention_decode_paged(
   // Second kernel version: the anchored decode-window mask is a separate
   // template instantiation, generated only for the fp16-KV configuration;
   // the non-anchored instantiations stay untouched.
-  const auto launch_partition = [&](auto anchored_tag) {
+  const auto launch_partition = [&](auto anchored_tag, auto fast_tag) {
     constexpr bool kAnchored = decltype(anchored_tag)::value;
-    flash_attention_decode_partition_kernel<D, PARTITION_SIZE, KV_DTYPE,
-                                            SEQ_LEN_ROUTE, kAnchored>
+    constexpr bool kFast = decltype(fast_tag)::value;
+    flash_attention_decode_partition_kernel<
+        D, PARTITION_SIZE, KV_DTYPE, SEQ_LEN_ROUTE, kAnchored, PARTIAL_T, kFast>
         <<<partition_grid, block, 0, stream>>>(
             reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),
             k_cache.data_ptr(), v_cache.data_ptr(),
-            reinterpret_cast<__half*>(tmp_out.data_ptr<at::Half>()),
+            reinterpret_cast<PARTIAL_T*>(tmp_out.data_ptr()),
             max_logits.data_ptr<float>(), exp_sums.data_ptr<float>(),
             block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),
             active_num_partitions.data_ptr<int>(), batch_size, max_num_blocks,
@@ -3301,23 +3533,39 @@ void launch_flash_attention_decode_paged(
   };
   if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
     if (use_anchored) {
-      launch_partition(std::true_type{});
+      launch_partition(std::true_type{}, std::false_type{});
     } else {
-      launch_partition(std::false_type{});
+      launch_partition(std::false_type{}, std::false_type{});
     }
   } else {
     TORCH_CHECK(!use_anchored,
                 "anchored decode window requires an fp16 KV cache");
-    launch_partition(std::false_type{});
+    if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 && D == 256 &&
+                  PARTITION_SIZE == 1024 && std::is_same_v<PARTIAL_T, float>) {
+      const char* enabled = std::getenv("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST");
+      const bool use_fast = enabled && enabled[0] == '1' &&
+                            enabled[1] == '\0' && batch_size == 8 &&
+                            num_heads_q == 12 && num_heads_kv == 2 &&
+                            window_size_left == -1 && window_size_right == -1;
+      if (use_fast) {
+        tp2_e4m3_scalar_fast_calls.fetch_add(1, std::memory_order_relaxed);
+        launch_partition(std::false_type{}, std::true_type{});
+      } else {
+        launch_partition(std::false_type{}, std::false_type{});
+      }
+    } else {
+      launch_partition(std::false_type{}, std::false_type{});
+    }
   }
 
   if (!launch_reduce) {
     return;
   }
 
-  flash_attention_decode_reduce_kernel<D, PARTITION_SIZE>
+  flash_attention_decode_reduce_kernel<D, PARTITION_SIZE, kXQARouteAllSeqLens,
+                                       PARTIAL_T>
       <<<reduce_grid, block, reduce_shared_mem, stream>>>(
-          reinterpret_cast<const __half*>(tmp_out.data_ptr<at::Half>()),
+          reinterpret_cast<const PARTIAL_T*>(tmp_out.data_ptr()),
           max_logits.data_ptr<float>(), exp_sums.data_ptr<float>(),
           seq_lens.data_ptr<int>(), active_num_partitions.data_ptr<int>(),
           reinterpret_cast<__half*>(out.data_ptr<at::Half>()), batch_size,
@@ -3326,7 +3574,8 @@ void launch_flash_attention_decode_paged(
           out.stride(0), out.stride(1), 0, 0, 0, 0);
 }
 
-template <int PARTITION_SIZE, int SEQ_LEN_ROUTE = kXQARouteAllSeqLens>
+template <int PARTITION_SIZE, int SEQ_LEN_ROUTE = kXQARouteAllSeqLens,
+          typename PARTIAL_T = __half>
 void launch_flash_attention_decode_xqa_split_reduce(
     at::Tensor& out, const at::Tensor& seq_lens, const at::Tensor& tmp_out,
     at::Tensor& max_logits, at::Tensor& exp_sums,
@@ -3352,10 +3601,10 @@ void launch_flash_attention_decode_xqa_split_reduce(
     const dim3 output_grid(batch_size, num_heads_q,                          \
                            (256 + D_TILE - 1) / D_TILE);                     \
     const dim3 output_block(D_TILE);                                         \
-    flash_attention_decode_xqa_reduce_output_kernel<256, PARTITION_SIZE,     \
-                                                    D_TILE, SEQ_LEN_ROUTE>   \
+    flash_attention_decode_xqa_reduce_output_kernel<                         \
+        256, PARTITION_SIZE, D_TILE, SEQ_LEN_ROUTE, PARTIAL_T>               \
         <<<output_grid, output_block, 0, stream>>>(                          \
-            reinterpret_cast<const __half*>(tmp_out.data_ptr<at::Half>()),   \
+            reinterpret_cast<const PARTIAL_T*>(tmp_out.data_ptr()),          \
             max_logits.data_ptr<float>(), exp_sums.data_ptr<float>(),        \
             seq_lens.data_ptr<int>(),                                        \
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()), batch_size, \
@@ -3386,7 +3635,10 @@ template <int PARTITION_SIZE, int GROUP_SIZE, bool PADDED_SMEM,
           bool ALIGNED_PADDED_SMEM = false,
           int SEQ_LEN_ROUTE = kXQARouteAllSeqLens, bool QK_SW_PIPELINE = false,
           bool PARTITION_PAGE_IDS = false, bool FP8_PAIR_LOAD = false,
-          int KV_DTYPE_OVERRIDE = -1, bool E4M3_SHARED_LUT = false>
+          int KV_DTYPE_OVERRIDE = -1, bool E4M3_SHARED_LUT = false,
+          typename PARTIAL_T = std::conditional_t<
+              KV_DTYPE_OVERRIDE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3, float,
+              __half>>
 void launch_flash_attention_decode_paged_xqa_tc_256_wide(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     at::Tensor& out, const at::Tensor& block_table, const at::Tensor& seq_lens,
@@ -3400,6 +3652,9 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
   static_assert(!E4M3_SHARED_LUT ||
                     KV_DTYPE_OVERRIDE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3,
                 "The shared conversion LUT requires an E4M3 specialization");
+  static_assert(KV_DTYPE_OVERRIDE != flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
+                    std::is_same_v<PARTIAL_T, float>,
+                "E4M3 XQA must preserve partition outputs in FP32");
   const int batch_size = q.size(0);
   const int num_heads_q = q.size(1);
   const int num_heads_kv = k_cache.size(2);
@@ -3418,7 +3673,7 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
             PARTITION_SIZE, GROUP_SIZE, PADDED_SMEM, NUM_THREADS,              \
             MIN_BLOCKS_PER_SM, BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,             \
             ALIGNED_PADDED_SMEM, KV_DTYPE, SEQ_LEN_ROUTE, QK_SW_PIPELINE,      \
-            PARTITION_PAGE_IDS, FP8_PAIR_LOAD, E4M3_SHARED_LUT>;               \
+            PARTITION_PAGE_IDS, FP8_PAIR_LOAD, E4M3_SHARED_LUT, PARTIAL_T>;    \
     cudaFuncSetAttribute(partition_kernel,                                     \
                          cudaFuncAttributeMaxDynamicSharedMemorySize,          \
                          shared_mem);                                          \
@@ -3431,11 +3686,11 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
         PARTITION_SIZE, GROUP_SIZE, PADDED_SMEM, NUM_THREADS,                  \
         MIN_BLOCKS_PER_SM, BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,                 \
         ALIGNED_PADDED_SMEM, KV_DTYPE, SEQ_LEN_ROUTE, QK_SW_PIPELINE,          \
-        PARTITION_PAGE_IDS, FP8_PAIR_LOAD, E4M3_SHARED_LUT>                    \
+        PARTITION_PAGE_IDS, FP8_PAIR_LOAD, E4M3_SHARED_LUT, PARTIAL_T>         \
         <<<partition_grid, NUM_THREADS, shared_mem, stream>>>(                 \
             reinterpret_cast<const __half*>(q.data_ptr<at::Half>()),           \
             k_cache.data_ptr(), v_cache.data_ptr(),                            \
-            reinterpret_cast<__half*>(tmp_out.data_ptr<at::Half>()),           \
+            reinterpret_cast<PARTIAL_T*>(tmp_out.data_ptr()),                  \
             max_logits.data_ptr<float>(), exp_sums.data_ptr<float>(),          \
             block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),             \
             active_num_partitions.data_ptr<int>(), batch_size, max_num_blocks, \
@@ -3477,7 +3732,8 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
   }
   if (use_split_reduce) {
     if constexpr (PARTITION_SIZE != -1) {
-      launch_flash_attention_decode_xqa_split_reduce<PARTITION_SIZE>(
+      launch_flash_attention_decode_xqa_split_reduce<PARTITION_SIZE,
+                                                     SEQ_LEN_ROUTE, PARTIAL_T>(
           out, seq_lens, tmp_out, max_logits, exp_sums, launch_num_partitions,
           split_reduce_dim_tile, stream);
     }
@@ -3486,9 +3742,10 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
     const dim3 block(kThreadsPerBlock);
     const size_t reduce_shared_mem =
         static_cast<size_t>(2 * launch_num_partitions) * sizeof(float);
-    flash_attention_decode_reduce_kernel<256, PARTITION_SIZE, SEQ_LEN_ROUTE>
+    flash_attention_decode_reduce_kernel<256, PARTITION_SIZE, SEQ_LEN_ROUTE,
+                                         PARTIAL_T>
         <<<reduce_grid, block, reduce_shared_mem, stream>>>(
-            reinterpret_cast<const __half*>(tmp_out.data_ptr<at::Half>()),
+            reinterpret_cast<const PARTIAL_T*>(tmp_out.data_ptr()),
             max_logits.data_ptr<float>(), exp_sums.data_ptr<float>(),
             seq_lens.data_ptr<int>(), active_num_partitions.data_ptr<int>(),
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()), batch_size,
@@ -3501,9 +3758,10 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <int PARTITION_SIZE, int SEQ_LEN_ROUTE = kXQARouteAllSeqLens,
+template <int PARTITION_SIZE, int BLOCK_SIZE,
+          int SEQ_LEN_ROUTE = kXQARouteAllSeqLens,
           bool FIXED_INTERLEAVED_HKV1_LAYOUT = false>
-void launch_flash_attention_decode_paged_xqa_e4m3_g6_page1568(
+void launch_flash_attention_decode_paged_xqa_e4m3_g6_aligned_page(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     at::Tensor& out, const at::Tensor& block_table, const at::Tensor& seq_lens,
     at::Tensor& tmp_out, at::Tensor& max_logits, at::Tensor& exp_sums,
@@ -3513,13 +3771,60 @@ void launch_flash_attention_decode_paged_xqa_e4m3_g6_page1568(
     const int route_seq_len_end = 0, const int route_seq_len_final = 0,
     const bool launch_reduce = true) {
   launch_flash_attention_decode_paged_xqa_tc_256_wide<
-      PARTITION_SIZE, 6, true, kXQATCG6DualCtaThreads, 2, 1568,
+      PARTITION_SIZE, 6, true, kXQATCG6DualCtaThreads, 2, BLOCK_SIZE,
       FIXED_INTERLEAVED_HKV1_LAYOUT, false, SEQ_LEN_ROUTE, false, true, false,
       flash_v100::KV_CACHE_DTYPE_FP8_E4M3, true>(
       q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
       exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
       launch_num_partitions, false, 8, stream, route_seq_len_begin,
       route_seq_len_end, route_seq_len_final, launch_reduce);
+}
+
+template <int PARTITION_SIZE, int SEQ_LEN_ROUTE = kXQARouteAllSeqLens,
+          bool ENABLE_FIXED_INTERLEAVED_HKV1_LAYOUT = false>
+void launch_flash_attention_decode_paged_xqa_e4m3_g6_page_dispatch(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    at::Tensor& out, const at::Tensor& block_table, const at::Tensor& seq_lens,
+    at::Tensor& tmp_out, at::Tensor& max_logits, at::Tensor& exp_sums,
+    const at::Tensor& active_num_partitions, const float softmax_scale,
+    const float k_scale, const float v_scale, const int launch_num_partitions,
+    cudaStream_t stream, const bool fixed_interleaved_hkv1_layout,
+    const int route_seq_len_begin = 0, const int route_seq_len_end = 0,
+    const int route_seq_len_final = 0, const bool launch_reduce = true) {
+#define LAUNCH_E4M3_ALIGNED_PAGE(BLOCK_SIZE, FIXED_LAYOUT)                   \
+  launch_flash_attention_decode_paged_xqa_e4m3_g6_aligned_page<              \
+      PARTITION_SIZE, BLOCK_SIZE, SEQ_LEN_ROUTE, FIXED_LAYOUT>(              \
+      q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,  \
+      exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,      \
+      launch_num_partitions, stream, route_seq_len_begin, route_seq_len_end, \
+      route_seq_len_final, launch_reduce)
+
+  if (k_cache.size(1) == 800) {
+    if constexpr (ENABLE_FIXED_INTERLEAVED_HKV1_LAYOUT) {
+      if (fixed_interleaved_hkv1_layout) {
+        LAUNCH_E4M3_ALIGNED_PAGE(800, true);
+      } else {
+        LAUNCH_E4M3_ALIGNED_PAGE(800, false);
+      }
+    } else {
+      LAUNCH_E4M3_ALIGNED_PAGE(800, false);
+    }
+  } else if (k_cache.size(1) == 1568) {
+    if constexpr (ENABLE_FIXED_INTERLEAVED_HKV1_LAYOUT) {
+      if (fixed_interleaved_hkv1_layout) {
+        LAUNCH_E4M3_ALIGNED_PAGE(1568, true);
+      } else {
+        LAUNCH_E4M3_ALIGNED_PAGE(1568, false);
+      }
+    } else {
+      LAUNCH_E4M3_ALIGNED_PAGE(1568, false);
+    }
+  } else {
+    TORCH_CHECK(!fixed_interleaved_hkv1_layout,
+                "Fixed E4M3 Hkv=1 layout requires page 800 or 1568");
+    LAUNCH_E4M3_ALIGNED_PAGE(0, false);
+  }
+#undef LAUNCH_E4M3_ALIGNED_PAGE
 }
 
 void launch_flash_attention_decode_paged_xqa_tc_256_staged(
@@ -3658,10 +3963,23 @@ constexpr int kGroupedSparseQueries = 8;
 constexpr int kGroupedSparsePlannerThreads = 512;
 constexpr int kGroupedSparseHashCapacity = 8192;
 constexpr unsigned long long kGroupedSparseEmptyEntry = 0x00000000ffffffffULL;
+constexpr int kGroupedSparseItemsPerThread =
+    kGroupedSparseHashCapacity / kGroupedSparsePlannerThreads;
+using GroupedSparseSort =
+    cub::BlockRadixSort<unsigned long long, kGroupedSparsePlannerThreads,
+                        kGroupedSparseItemsPerThread, unsigned long long>;
+// Hash entries plus logical owners exactly fit Volta's 96 KiB opt-in limit.
+// After loading both into registers, reuse this storage for sorting and scans.
+constexpr size_t kGroupedSparsePlannerSharedMemory =
+    kGroupedSparseHashCapacity *
+    (sizeof(unsigned long long) + sizeof(uint32_t));
+static_assert(sizeof(GroupedSparseSort::TempStorage) <=
+              kGroupedSparsePlannerSharedMemory);
 
 __device__ __forceinline__ void grouped_sparse_hash_insert(
-    unsigned long long* __restrict__ hash_table, const int physical_microblock,
-    const uint32_t token_mask) {
+    unsigned long long* __restrict__ hash_table,
+    uint32_t* __restrict__ logical_owners, const int physical_microblock,
+    const uint32_t token_mask, const int query, const int logical_token) {
   if (physical_microblock < 0 || token_mask == 0) {
     return;
   }
@@ -3674,13 +3992,17 @@ __device__ __forceinline__ void grouped_sparse_hash_insert(
   for (int probe = 0; probe < kGroupedSparseHashCapacity; ++probe) {
     const unsigned long long old =
         atomicCAS(hash_table + slot, kGroupedSparseEmptyEntry, desired);
-    if (old == kGroupedSparseEmptyEntry) {
-      return;
-    }
-    if (static_cast<uint32_t>(old) ==
-        static_cast<uint32_t>(physical_microblock)) {
+    if (old == kGroupedSparseEmptyEntry ||
+        static_cast<uint32_t>(old) ==
+            static_cast<uint32_t>(physical_microblock)) {
       atomicOr(hash_table + slot, static_cast<unsigned long long>(token_mask)
                                       << 32);
+      // Nonnegative int32 tokens use at most 29 bits after division by four.
+      // The first contributing query owns shared pages, independent of request
+      // slot IDs, physical allocation, insertion order, and hash collisions.
+      const uint32_t owner = (static_cast<uint32_t>(query) << 29) |
+                             (static_cast<uint32_t>(logical_token) >> 2);
+      atomicMin(logical_owners + slot, owner);
       return;
     }
     slot = (slot + 1) & (kGroupedSparseHashCapacity - 1);
@@ -3740,15 +4062,13 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
     const int physical_page_stride, const int num_cache_blocks) {
   const int group_idx = blockIdx.x;
   const int tid = threadIdx.x;
-  __shared__ int category_counts[8];
-  __shared__ int category_offsets[8];
-  __shared__ int category_cursors[8];
-  __shared__ int
-      warp_category_prefix[(kGroupedSparsePlannerThreads / kWarpSize) * 8];
   extern __shared__ unsigned long long hash_table[];
+  auto* logical_owners =
+      reinterpret_cast<uint32_t*>(hash_table + kGroupedSparseHashCapacity);
   for (int slot = tid; slot < kGroupedSparseHashCapacity;
        slot += kGroupedSparsePlannerThreads) {
     hash_table[slot] = kGroupedSparseEmptyEntry;
+    logical_owners[slot] = UINT_MAX;
   }
   __syncthreads();
 
@@ -3792,8 +4112,9 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
             first_token, request_idx, request_block_table,
             request_block_table_stride, block_table_width, page_size,
             physical_page_stride, num_cache_blocks);
-        grouped_sparse_hash_insert(hash_table, physical_microblock,
-                                   0xFu << (query * 4));
+        grouped_sparse_hash_insert(hash_table, logical_owners,
+                                   physical_microblock, 0xFu << (query * 4),
+                                   query, first_token);
       } else {
 #pragma unroll
         for (int token_offset = 0; token_offset < 4; ++token_offset) {
@@ -3803,8 +4124,9 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
                 token, request_idx, request_block_table,
                 request_block_table_stride, block_table_width, page_size,
                 physical_page_stride, num_cache_blocks);
-            grouped_sparse_hash_insert(hash_table, physical_microblock,
-                                       1u << (query * 4 + (token & 3)));
+            grouped_sparse_hash_insert(
+                hash_table, logical_owners, physical_microblock,
+                1u << (query * 4 + (token & 3)), query, token);
           }
         }
       }
@@ -3841,10 +4163,45 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
             request_block_table_stride, block_table_width, page_size,
             physical_page_stride, num_cache_blocks);
         const uint32_t tail_mask = ((1u << tail_count) - 1) << (query * 4);
-        grouped_sparse_hash_insert(hash_table, physical_microblock, tail_mask);
+        grouped_sparse_hash_insert(hash_table, logical_owners,
+                                   physical_microblock, tail_mask, query,
+                                   selected_tail_token);
       }
     }
   }
+  __syncthreads();
+
+  // Keep the existing physical-page union and masks, but never let physical
+  // hash slots determine the attention reduction order. Category is primary
+  // to preserve active-tile packing; the logical owner orders each category.
+  unsigned long long entries[kGroupedSparseItemsPerThread];
+  unsigned long long sort_keys[kGroupedSparseItemsPerThread];
+#pragma unroll
+  for (int item = 0; item < kGroupedSparseItemsPerThread; ++item) {
+    const int slot = tid * kGroupedSparseItemsPerThread + item;
+    const unsigned long long entry = hash_table[slot];
+    entries[item] = entry;
+    const int category =
+        grouped_sparse_active_m_tiles(static_cast<uint32_t>(entry >> 32));
+    sort_keys[item] = static_cast<uint32_t>(entry) == 0xffffffffu
+                          ? ULLONG_MAX
+                          : (static_cast<unsigned long long>(category) << 32) |
+                                logical_owners[slot];
+  }
+  __syncthreads();
+  auto& sort_storage =
+      *reinterpret_cast<GroupedSparseSort::TempStorage*>(hash_table);
+  // Three category bits, 32 owner bits, and one bit separating empty slots.
+  GroupedSparseSort(sort_storage).Sort(sort_keys, entries, 0, 36);
+  __syncthreads();
+#pragma unroll
+  for (int item = 0; item < kGroupedSparseItemsPerThread; ++item) {
+    hash_table[tid * kGroupedSparseItemsPerThread + item] = entries[item];
+  }
+  auto* category_counts = reinterpret_cast<int*>(logical_owners);
+  int* category_offsets = category_counts + 8;
+  int* category_cursors = category_offsets + 8;
+  int* warp_category_prefix = category_cursors + 8;
   __syncthreads();
 
   if (tid < 8) {
@@ -4005,17 +4362,16 @@ at::Tensor flash_attention_grouped_sparse_page4_plan(
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
               "grouped sparse page4 planner supports SM70 only");
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-  constexpr size_t kPlannerSharedMemory =
-      kGroupedSparseHashCapacity * sizeof(unsigned long long);
-  const cudaError_t smem_status = cudaFuncSetAttribute(
-      grouped_sparse_page4_plan_kernel,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, kPlannerSharedMemory);
+  const cudaError_t smem_status =
+      cudaFuncSetAttribute(grouped_sparse_page4_plan_kernel,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           kGroupedSparsePlannerSharedMemory);
   TORCH_CHECK(smem_status == cudaSuccess,
               "Failed to set grouped sparse page4 planner shared memory: ",
               cudaGetErrorString(smem_status));
-  grouped_sparse_page4_plan_kernel<<<static_cast<unsigned>(num_groups),
-                                     kGroupedSparsePlannerThreads,
-                                     kPlannerSharedMemory, stream>>>(
+  grouped_sparse_page4_plan_kernel<<<
+      static_cast<unsigned>(num_groups), kGroupedSparsePlannerThreads,
+      kGroupedSparsePlannerSharedMemory, stream>>>(
       logical_indices.data_ptr<int>(), block_table.data_ptr<int>(),
       token_to_req.data_ptr<int>(), query_positions.data_ptr<int64_t>(),
       sequence_lengths.data_ptr<int>(), output_blocks.data_ptr<int>(),
@@ -4029,8 +4385,128 @@ at::Tensor flash_attention_grouped_sparse_page4_plan(
   return output_blocks;
 }
 
+at::Tensor flash_attention_grouped_e4m3_fp32_paged(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    at::Tensor& out, const at::Tensor& block_table,
+    const at::Tensor& row_lengths, at::Tensor& partial, at::Tensor& lse,
+    float scale, float k_scale, float v_scale) {
+  TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf &&
+                  q.is_contiguous() && q.dim() == 3 && q.size(0) >= 2 &&
+                  q.size(0) <= 8 && q.size(1) == 6 && q.size(2) == 256,
+              "E4M3 grouped FP32 requires contiguous CUDA FP16 Q [2..8,6,256]");
+  TORCH_CHECK(
+      k.dim() == 4 && k.size(2) == 1 && k.size(3) == 256 &&
+          (k.size(1) == 800 || k.size(1) == 848 || k.size(1) == 1616 ||
+           k.size(1) == 1648 || k.size(1) == 1728 || k.size(1) == 3296 ||
+           k.size(1) == 3456) &&
+          k.scalar_type() == at::kByte && v.scalar_type() == at::kByte &&
+          v.sizes() == k.sizes(),
+      "E4M3 grouped FP32 requires supported uint8 paged KV [pages,page,1,256]");
+  TORCH_CHECK(
+      block_table.dim() == 2 && block_table.size(0) == 1 &&
+          block_table.is_contiguous() &&
+          block_table.scalar_type() == at::kInt && block_table.size(1) > 0 &&
+          block_table.size(1) * k.size(1) <= 266240 &&
+          row_lengths.sizes() == at::IntArrayRef({q.size(0)}) &&
+          row_lengths.scalar_type() == at::kInt && row_lengths.is_contiguous(),
+      "E4M3 grouped FP32 requires one KV sequence and per-query int32 lengths");
+  TORCH_CHECK(out.sizes() == q.sizes() && out.is_contiguous() &&
+                  out.scalar_type() == at::kHalf,
+              "E4M3 grouped FP32 output must be contiguous FP16 and Q-shaped");
+  TORCH_CHECK(partial.sizes() == at::IntArrayRef({80, 8, 6, 256}) &&
+                  partial.is_contiguous() &&
+                  partial.scalar_type() == at::kFloat &&
+                  lse.sizes() == at::IntArrayRef({80, 8, 6, 2}) &&
+                  lse.is_contiguous() && lse.scalar_type() == at::kFloat,
+              "E4M3 grouped FP32 requires numerator [80,8,6,256] and max/sum "
+              "[80,8,6,2]");
+  TORCH_CHECK(
+      std::isfinite(scale) && std::isfinite(k_scale) &&
+          std::isfinite(v_scale) && k_scale > 0 && v_scale > 0,
+      "E4M3 grouped FP32 requires finite scale and positive finite KV scales");
+  for (const auto* t :
+       {&k, &v, static_cast<const at::Tensor*>(&out), &block_table,
+        &row_lengths, static_cast<const at::Tensor*>(&partial),
+        static_cast<const at::Tensor*>(&lse)}) {
+    TORCH_CHECK(t->device() == q.device(),
+                "E4M3 grouped tensors must share device");
+  }
+  for (const auto* t : {&k, &v}) {
+    // Explicit-row FP32 groups retain the 8-byte loader. The dense q8
+    // verifier's paired loader requires 16-byte strides and is gated there;
+    // inheriting it here would truncate valid 8-but-not-16-byte offsets.
+    TORCH_CHECK(t->stride(3) == 1 &&
+                    reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0,
+                "E4M3 grouped KV requires aligned contiguous head dimension");
+    for (int i = 0; i < 3; ++i)
+      TORCH_CHECK(t->stride(i) % 8 == 0,
+                  "E4M3 grouped KV strides must be multiples of 8");
+  }
+  c10::cuda::CUDAGuard guard(q.device());
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "E4M3 grouped FP32 supports SM70 only");
+  // A contiguous FP16 view can start at a half-element storage offset.
+  // The shared-Q feed uses uint4 loads; only those exceptional views need
+  // an aligned, stream-local copy. Ordinary model Q keeps the original path.
+  const at::Tensor aligned_q =
+      reinterpret_cast<uintptr_t>(q.data_ptr()) % 16 == 0 ? q : q.clone();
+  const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto kernel = flash_attention_grouped_verify_e5m2_partial_kernel<
+      8, false, 0, false, false, false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3,
+      false, float, true, true>;
+  constexpr int kCompensatedSmemBytes =
+      sizeof(GroupedVerifySmem) +
+      kGroupedVerifyRows * kGroupedVerifyProbStride * sizeof(__half);
+  static_assert(kCompensatedSmemBytes <= 64 * 1024,
+                "compensated P must fit the SM70 shared-memory budget");
+  C10_CUDA_CHECK(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           kCompensatedSmemBytes));
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+  kernel<<<dim3(1, 80), kGroupedVerifyThreads, kCompensatedSmemBytes, stream>>>(
+      reinterpret_cast<const __half*>(aligned_q.data_ptr()), k.data_ptr(),
+      v.data_ptr(), block_table.data_ptr<int>(), row_lengths.data_ptr<int>(),
+      partial.data_ptr<float>(), lse.data_ptr<float>(), q.size(0),
+      block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
+      v.stride(0), v.stride(1), v.stride(2), scale * k_scale, v_scale, nullptr,
+      1, row_lengths.data_ptr<int>());
+  flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true>
+      <<<dim3(q.size(0), 6), kGroupedVerifyThreads, 0, stream>>>(
+          partial.data_ptr<float>(), lse.data_ptr<float>(),
+          row_lengths.data_ptr<int>(),
+          reinterpret_cast<__half*>(out.data_ptr()), q.size(0),
+          row_lengths.data_ptr<int>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+int64_t flash_attention_grouped_e4m3_fp32_precision_version() {
+  // Revision 3 retains unnormalized FP32 numerators and separate max/sum.
+  // Older normalized-partial/LSE workspaces are not ABI-compatible.
+  // Revision 4 admits DFlash2 1728/3456 pages and FP32 scalar E4M3 partials.
+  return 4;
+}
+
+int64_t flash_attention_tp2_e4m3_scalar_fast_version() { return 2; }
+
+int64_t flash_attention_tp2_e4m3_scalar_fast_launch_count() {
+  // Includes capture-time launches; CUDA Graph replay does not call this host
+  // dispatcher again. This counter proves route admission, not round count.
+  return tp2_e4m3_scalar_fast_calls.load(std::memory_order_relaxed);
+}
+
 int64_t flash_attention_grouped_verify_max_query_tokens() {
   return kGroupedVerifyMaxSupportedQ;
+}
+
+int64_t flash_attention_grouped_verify_request_major_abi_version() { return 1; }
+
+int64_t flash_attention_grouped_sparse_page4_abi_version() {
+  // Version 1 accepted FP16 K/V through the nine-argument forward binding.
+  // Version 2 adds kv_cache_dtype and calibrated K/V scales.
+  return 2;
 }
 
 at::Tensor flash_attention_grouped_verify_paged(
@@ -4047,23 +4523,36 @@ at::Tensor flash_attention_grouped_verify_paged(
   TORCH_CHECK(partial_out.is_cuda() && partial_lse.is_cuda(),
               "grouped verify workspaces must be CUDA tensors");
   TORCH_CHECK(q.dtype() == torch::kFloat16, "grouped verify q must be fp16");
-  TORCH_CHECK(kv_cache_dtype == "fp8_e5m2",
-              "grouped verify prototype supports fp8_e5m2 KV only");
+  TORCH_CHECK(kv_cache_dtype == "fp8_e5m2" || kv_cache_dtype == "fp8_e4m3",
+              "grouped verify requires E5M2 or E4M3 KV");
+  TORCH_CHECK(kv_cache_dtype != "fp8_e4m3" || (q.size(0) == 8 && one_pass),
+              "E4M3 grouped verify requires q=8 and one_pass=true");
+  TORCH_CHECK(kv_cache_dtype != "fp8_e4m3" ||
+                  (k_cache.stride(0) % 16 == 0 && k_cache.stride(1) % 16 == 0 &&
+                   v_cache.stride(0) % 16 == 0 && v_cache.stride(1) % 16 == 0),
+              "E4M3 grouped verify requires 16-byte-aligned KV strides");
   TORCH_CHECK(
       k_cache.dtype() == torch::kUInt8 && v_cache.dtype() == torch::kUInt8,
-      "grouped verify E5M2 cache must use uint8 storage");
+      "grouped verify FP8 cache must use uint8 storage");
   TORCH_CHECK(
       block_table.dtype() == torch::kInt32 && seq_lens.dtype() == torch::kInt32,
       "grouped verify block_table/seq_lens must be int32");
   TORCH_CHECK(partial_out.dtype() == torch::kFloat16 &&
                   partial_lse.dtype() == torch::kFloat32,
               "grouped verify workspaces must be fp16/fp32");
-  TORCH_CHECK(q.dim() == 3 && q.size(0) > 0 &&
-                  q.size(0) <= kGroupedVerifyMaxSupportedQ &&
+  TORCH_CHECK(block_table.dim() == 2 && block_table.size(0) > 0,
+              "grouped verify block_table must have shape [batch, blocks]");
+  const int64_t batch_size = block_table.size(0);
+  TORCH_CHECK(q.dim() == 3 && q.size(0) > 0 && q.size(0) % batch_size == 0 &&
                   q.size(1) == kGroupedVerifyHeads &&
                   q.size(2) == kGroupedVerifyHeadDim,
-              "grouped verify q must have shape [1..16, 6, 256]");
-  const bool wide_query = q.size(0) > kGroupedVerifyQ8MaxQ;
+              "grouped verify q must have shape [batch * query, 6, 256]");
+  const int64_t query_len = q.size(0) / batch_size;
+  TORCH_CHECK(
+      batch_size == 1 ? query_len <= kGroupedVerifyMaxSupportedQ
+                      : query_len == kGroupedVerifyQ8MaxQ,
+      "grouped verify requires q1..q16 for B1 or request-major q8 for batches");
+  const bool wide_query = query_len > kGroupedVerifyQ8MaxQ;
   const int max_query_tokens =
       wide_query ? kGroupedVerifyQ16MaxQ : kGroupedVerifyQ8MaxQ;
   const int grouped_splits = kGroupedVerifyWorkspaceRows / max_query_tokens;
@@ -4074,10 +4563,8 @@ at::Tensor flash_attention_grouped_verify_paged(
                   k_cache.size(2) == 1 &&
                   k_cache.size(3) == kGroupedVerifyHeadDim,
               "grouped verify KV must have shape [blocks, page, 1, 256]");
-  TORCH_CHECK(block_table.dim() == 2 && block_table.size(0) == 1,
-              "grouped verify block_table must have shape [1, blocks]");
-  TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.size(0) >= 1,
-              "grouped verify seq_lens must cover one sequence");
+  TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.size(0) == batch_size,
+              "grouped verify seq_lens must cover every request");
   TORCH_CHECK(q.is_contiguous(),
               "grouped verify q must be contiguous [M, H, D]");
   TORCH_CHECK(block_table.is_contiguous() && seq_lens.is_contiguous(),
@@ -4086,15 +4573,31 @@ at::Tensor flash_attention_grouped_verify_paged(
               "grouped verify KV head dimension must be contiguous");
   TORCH_CHECK(partial_out.is_contiguous() && partial_lse.is_contiguous(),
               "grouped verify workspaces must be contiguous");
-  TORCH_CHECK(partial_out.sizes() ==
-                  at::IntArrayRef({grouped_splits, max_query_tokens,
-                                   kGroupedVerifyHeads, kGroupedVerifyHeadDim}),
-              "partial_out must have shape [80, 8, 6, 256] or "
-              "[40, 16, 6, 256]");
-  TORCH_CHECK(
+  const bool single_out =
+      batch_size == 1 &&
+      partial_out.sizes() ==
+          at::IntArrayRef({grouped_splits, max_query_tokens,
+                           kGroupedVerifyHeads, kGroupedVerifyHeadDim});
+  const bool batched_out =
+      batch_size > 1 &&
+      partial_out.sizes() ==
+          at::IntArrayRef({batch_size, grouped_splits, max_query_tokens,
+                           kGroupedVerifyHeads, kGroupedVerifyHeadDim});
+  TORCH_CHECK(single_out || batched_out,
+              "partial_out must be [splits, query, 6, 256] for B1 or "
+              "[batch, splits, query, 6, 256]");
+  const bool single_lse =
+      batch_size == 1 &&
       partial_lse.sizes() == at::IntArrayRef({grouped_splits, max_query_tokens,
-                                              kGroupedVerifyHeads}),
-      "partial_lse must have shape [80, 8, 6] or [40, 16, 6]");
+                                              kGroupedVerifyHeads});
+  const bool batched_lse =
+      batch_size > 1 &&
+      partial_lse.sizes() ==
+          at::IntArrayRef({batch_size, grouped_splits, max_query_tokens,
+                           kGroupedVerifyHeads});
+  TORCH_CHECK(single_lse || batched_lse,
+              "partial_lse must be [splits, query, 6] for B1 or "
+              "[batch, splits, query, 6]");
   TORCH_CHECK(k_scale > 0.0f && v_scale > 0.0f,
               "grouped verify E5M2 K/V scales must be positive");
 
@@ -4117,16 +4620,17 @@ at::Tensor flash_attention_grouped_verify_paged(
               "grouped verify prototype supports SM70 only");
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-  const dim3 partial_grid(head_groups, grouped_splits, 1);
+  const dim3 partial_grid(head_groups, grouped_splits,
+                          static_cast<unsigned>(batch_size));
   const size_t partial_shared_mem = sizeof(GroupedVerifySmem);
 #define LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, PAGE_SIZE,   \
                                       SINGLE_QUERY, CONTIGUOUS_LAYOUT,         \
-                                      STAGE_PAGE_IDS)                          \
+                                      STAGE_PAGE_IDS, KV_TYPE)                 \
   do {                                                                         \
     auto partial_kernel =                                                      \
         (void*)flash_attention_grouped_verify_e5m2_partial_kernel<             \
             MAX_QUERY_TOKENS, TWO_PASS, PAGE_SIZE, SINGLE_QUERY,               \
-            CONTIGUOUS_LAYOUT, STAGE_PAGE_IDS>;                                \
+            CONTIGUOUS_LAYOUT, STAGE_PAGE_IDS, KV_TYPE>;                       \
     const cudaError_t smem_status = cudaFuncSetAttribute(                      \
         partial_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,           \
         partial_shared_mem);                                                   \
@@ -4140,18 +4644,18 @@ at::Tensor flash_attention_grouped_verify_paged(
                 cudaGetErrorString(carveout_status));                          \
     flash_attention_grouped_verify_e5m2_partial_kernel<                        \
         MAX_QUERY_TOKENS, TWO_PASS, PAGE_SIZE, SINGLE_QUERY,                   \
-        CONTIGUOUS_LAYOUT, STAGE_PAGE_IDS>                                     \
+        CONTIGUOUS_LAYOUT, STAGE_PAGE_IDS, KV_TYPE>                            \
         <<<partial_grid, kGroupedVerifyThreads, partial_shared_mem, stream>>>( \
             reinterpret_cast<const __half*>(q.data_ptr()), k_cache.data_ptr(), \
             v_cache.data_ptr(), block_table.data_ptr<int>(),                   \
             seq_lens.data_ptr<int>(),                                          \
             reinterpret_cast<__half*>(partial_out.data_ptr()),                 \
-            partial_lse.data_ptr<float>(), static_cast<int>(q.size(0)),        \
+            partial_lse.data_ptr<float>(), static_cast<int>(query_len),        \
             static_cast<int>(block_table.size(1)),                             \
             static_cast<int>(k_cache.size(1)), k_cache.stride(0),              \
             k_cache.stride(1), k_cache.stride(2), v_cache.stride(0),           \
             v_cache.stride(1), v_cache.stride(2), softmax_scale * k_scale,     \
-            v_scale, nullptr, 1);                                              \
+            v_scale, nullptr, static_cast<int>(batch_size));                   \
   } while (0)
 
 #define DISPATCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS,           \
@@ -4172,30 +4676,42 @@ at::Tensor flash_attention_grouped_verify_paged(
         fixed_interleaved_layout && dflash2_grouped_stage_page_ids_enabled(); \
     if (stage_page_ids && page_size == 1648) {                                \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 1648,         \
-                                    SINGLE_QUERY, true, true);                \
+                                    SINGLE_QUERY, true, true,                 \
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
     } else if (stage_page_ids) {                                              \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 3296,         \
-                                    SINGLE_QUERY, true, true);                \
+                                    SINGLE_QUERY, true, true,                 \
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
     } else if (fixed_interleaved_layout && page_size == 1648) {               \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 1648,         \
-                                    SINGLE_QUERY, true, false);               \
+                                    SINGLE_QUERY, true, false,                \
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
     } else if (fixed_interleaved_layout) {                                    \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 3296,         \
-                                    SINGLE_QUERY, true, false);               \
+                                    SINGLE_QUERY, true, false,                \
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
     } else if (page_size == 1648) {                                           \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 1648,         \
-                                    SINGLE_QUERY, false, false);              \
+                                    SINGLE_QUERY, false, false,               \
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
     } else if (page_size == 3296) {                                           \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 3296,         \
-                                    SINGLE_QUERY, false, false);              \
+                                    SINGLE_QUERY, false, false,               \
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
     } else {                                                                  \
       LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, 0,            \
-                                    SINGLE_QUERY, false, false);              \
+                                    SINGLE_QUERY, false, false,               \
+                                    flash_v100::KV_CACHE_DTYPE_FP8_E5M2);     \
     }                                                                         \
   } while (0)
 
-  const bool single_query = q.size(0) == 1;
-  if (wide_query && one_pass) {
+  const bool single_query = query_len == 1;
+  if (kv_cache_dtype == "fp8_e4m3") {
+    // Reuse the grouped q8 schedule and existing E4M3 vector conversion.
+    // Runtime strides cover both separate and interleaved hybrid KV pages.
+    LAUNCH_GROUPED_VERIFY_PARTIAL(kGroupedVerifyQ8MaxQ, false, 0, false, false,
+                                  false, flash_v100::KV_CACHE_DTYPE_FP8_E4M3);
+  } else if (wide_query && one_pass) {
     DISPATCH_GROUPED_VERIFY_PARTIAL(kGroupedVerifyQ16MaxQ, false, false);
   } else if (wide_query) {
     DISPATCH_GROUPED_VERIFY_PARTIAL(kGroupedVerifyQ16MaxQ, true, false);
@@ -4210,8 +4726,8 @@ at::Tensor flash_attention_grouped_verify_paged(
   }
 #undef DISPATCH_GROUPED_VERIFY_PARTIAL
 #undef LAUNCH_GROUPED_VERIFY_PARTIAL
-  const dim3 combine_grid(static_cast<unsigned>(q.size(0)), kGroupedVerifyHeads,
-                          1);
+  const dim3 combine_grid(static_cast<unsigned>(query_len), kGroupedVerifyHeads,
+                          static_cast<unsigned>(batch_size));
 #define LAUNCH_GROUPED_VERIFY_COMBINE(MAX_QUERY_TOKENS, SINGLE_QUERY)  \
   flash_attention_grouped_verify_e5m2_combine_kernel<MAX_QUERY_TOKENS, \
                                                      SINGLE_QUERY>     \
@@ -4219,7 +4735,7 @@ at::Tensor flash_attention_grouped_verify_paged(
           reinterpret_cast<const __half*>(partial_out.data_ptr()),     \
           partial_lse.data_ptr<float>(), seq_lens.data_ptr<int>(),     \
           reinterpret_cast<__half*>(out.data_ptr()),                   \
-          static_cast<int>(q.size(0)))
+          static_cast<int>(query_len))
   if (wide_query) {
     LAUNCH_GROUPED_VERIFY_COMBINE(kGroupedVerifyQ16MaxQ, false);
   } else if (single_query) {
@@ -4236,17 +4752,28 @@ at::Tensor flash_attention_grouped_sparse_page4(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& token_masks, const at::Tensor& seq_lens, at::Tensor& lse,
-    const float softmax_scale) {
+    const float softmax_scale, const std::string& kv_cache_dtype,
+    const float k_scale, const float v_scale) {
   constexpr int kQueriesPerGroup = kGroupedVerifyQ8MaxQ;
   TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(),
               "grouped sparse page4 q/K/V must be CUDA tensors");
   TORCH_CHECK(block_table.is_cuda() && token_masks.is_cuda() &&
                   seq_lens.is_cuda() && lse.is_cuda(),
               "grouped sparse page4 metadata must be CUDA tensors");
-  TORCH_CHECK(q.dtype() == torch::kFloat16 &&
-                  k_cache.dtype() == torch::kFloat16 &&
-                  v_cache.dtype() == torch::kFloat16,
-              "grouped sparse page4 requires fp16 q/K/V");
+  const bool e4m3_kv = kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3";
+  TORCH_CHECK(q.dtype() == torch::kFloat16,
+              "grouped sparse page4 requires fp16 queries");
+  TORCH_CHECK(e4m3_kv ? (k_cache.dtype() == torch::kUInt8 &&
+                         v_cache.dtype() == torch::kUInt8)
+                      : (k_cache.dtype() == torch::kFloat16 &&
+                         v_cache.dtype() == torch::kFloat16),
+              "grouped sparse page4 KV storage does not match kv_cache_dtype");
+  TORCH_CHECK(
+      e4m3_kv || kv_cache_dtype == "auto" || kv_cache_dtype == "float16",
+      "grouped sparse page4 supports fp16 and fp8_e4m3 KV only");
+  TORCH_CHECK(!e4m3_kv || (std::isfinite(k_scale) && std::isfinite(v_scale) &&
+                           k_scale > 0.0f && v_scale > 0.0f),
+              "grouped sparse page4 E4M3 scales must be finite and positive");
   TORCH_CHECK(block_table.dtype() == torch::kInt32 &&
                   seq_lens.dtype() == torch::kInt32 &&
                   token_masks.scalar_type() == at::ScalarType::UInt32,
@@ -4297,26 +4824,35 @@ at::Tensor flash_attention_grouped_sparse_page4(
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
   const dim3 grid(1, 1, static_cast<unsigned>(num_groups));
   const size_t shared_mem = sizeof(GroupedVerifySmem);
-  auto kernel = (void*)flash_attention_grouped_verify_e5m2_partial_kernel<
-      kQueriesPerGroup, false, 4, false, false, false,
-      flash_v100::KV_CACHE_DTYPE_FP16, true>;
-  const cudaError_t smem_status = cudaFuncSetAttribute(
-      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem);
-  TORCH_CHECK(smem_status == cudaSuccess,
-              "Failed to set grouped sparse page4 shared memory: ",
-              cudaGetErrorString(smem_status));
-  flash_attention_grouped_verify_e5m2_partial_kernel<
-      kQueriesPerGroup, false, 4, false, false, false,
-      flash_v100::KV_CACHE_DTYPE_FP16, true>
-      <<<grid, kGroupedVerifyThreads, shared_mem, stream>>>(
-          reinterpret_cast<const __half*>(q.data_ptr()), k_cache.data_ptr(),
-          v_cache.data_ptr(), block_table.data_ptr<int>(),
-          seq_lens.data_ptr<int>(), reinterpret_cast<__half*>(out.data_ptr()),
-          lse.data_ptr<float>(), kQueriesPerGroup,
-          static_cast<int>(block_table.size(1)), 4, k_cache.stride(0),
-          k_cache.stride(1), k_cache.stride(2), v_cache.stride(0),
-          v_cache.stride(1), v_cache.stride(2), softmax_scale, 1.0f,
-          token_masks.data_ptr<uint32_t>(), static_cast<int>(num_groups));
+#define LAUNCH_GROUPED_SPARSE_PAGE4(KV_DTYPE_CODE)                             \
+  do {                                                                         \
+    auto kernel = (void*)flash_attention_grouped_verify_e5m2_partial_kernel<   \
+        kQueriesPerGroup, false, 4, false, false, false, KV_DTYPE_CODE, true>; \
+    const cudaError_t smem_status = cudaFuncSetAttribute(                      \
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem);      \
+    TORCH_CHECK(smem_status == cudaSuccess,                                    \
+                "Failed to set grouped sparse page4 shared memory: ",          \
+                cudaGetErrorString(smem_status));                              \
+    flash_attention_grouped_verify_e5m2_partial_kernel<                        \
+        kQueriesPerGroup, false, 4, false, false, false, KV_DTYPE_CODE, true>  \
+        <<<grid, kGroupedVerifyThreads, shared_mem, stream>>>(                 \
+            reinterpret_cast<const __half*>(q.data_ptr()), k_cache.data_ptr(), \
+            v_cache.data_ptr(), block_table.data_ptr<int>(),                   \
+            seq_lens.data_ptr<int>(),                                          \
+            reinterpret_cast<__half*>(out.data_ptr()), lse.data_ptr<float>(),  \
+            kQueriesPerGroup, static_cast<int>(block_table.size(1)), 4,        \
+            k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),           \
+            v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),           \
+            softmax_scale * (e4m3_kv ? k_scale : 1.0f),                        \
+            e4m3_kv ? v_scale : 1.0f, token_masks.data_ptr<uint32_t>(),        \
+            static_cast<int>(num_groups));                                     \
+  } while (0)
+  if (e4m3_kv) {
+    LAUNCH_GROUPED_SPARSE_PAGE4(flash_v100::KV_CACHE_DTYPE_FP8_E4M3);
+  } else {
+    LAUNCH_GROUPED_SPARSE_PAGE4(flash_v100::KV_CACHE_DTYPE_FP16);
+  }
+#undef LAUNCH_GROUPED_SPARSE_PAGE4
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
@@ -4355,7 +4891,10 @@ at::Tensor flash_attention_decode_paged(
     TORCH_CHECK(k_scale > 0.f && v_scale > 0.f,
                 "fp8 k/v scales must be positive");
   }
-  TORCH_CHECK(tmp_out.dtype() == torch::kFloat16, "tmp_out must be fp16");
+  TORCH_CHECK(tmp_out.dtype() == torch::kFloat16 ||
+                  (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
+                   tmp_out.dtype() == torch::kFloat32),
+              "tmp_out must be fp16, or fp32 for E4M3 scalar decode");
   TORCH_CHECK(max_logits.dtype() == torch::kFloat32, "max_logits must be fp32");
   TORCH_CHECK(exp_sums.dtype() == torch::kFloat32, "exp_sums must be fp32");
   TORCH_CHECK(block_table.dtype() == torch::kInt32,
@@ -4456,21 +4995,31 @@ at::Tensor flash_attention_decode_paged(
       k_scale, v_scale, window_size_left, window_size_right, stream, 0, 0, 0, \
       true, anchor_lens_ptr, static_cast<int>(anchored_window))
 
-#define LAUNCH_BY_KV_DTYPE(HDIM, PARTITION)                                 \
-  do {                                                                      \
-    switch (kv_dtype_code) {                                                \
-      case flash_v100::KV_CACHE_DTYPE_FP16:                                 \
-        LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP16);     \
-        break;                                                              \
-      case flash_v100::KV_CACHE_DTYPE_FP8_E4M3:                             \
-        LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP8_E4M3); \
-        break;                                                              \
-      case flash_v100::KV_CACHE_DTYPE_FP8_E5M2:                             \
-        LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP8_E5M2); \
-        break;                                                              \
-      default:                                                              \
-        TORCH_CHECK(false, "Unsupported kv_cache_dtype: ", kv_cache_dtype); \
-    }                                                                       \
+#define LAUNCH_BY_KV_DTYPE(HDIM, PARTITION)                                   \
+  do {                                                                        \
+    switch (kv_dtype_code) {                                                  \
+      case flash_v100::KV_CACHE_DTYPE_FP16:                                   \
+        LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP16);       \
+        break;                                                                \
+      case flash_v100::KV_CACHE_DTYPE_FP8_E4M3:                               \
+        if (tmp_out.scalar_type() == at::kFloat) {                            \
+          launch_flash_attention_decode_paged<                                \
+              HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP8_E4M3,           \
+              kXQARouteAllSeqLens, float>(                                    \
+              q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,       \
+              max_logits, exp_sums, active_num_partitions, softmax_scale,     \
+              launch_num_partitions, k_scale, v_scale, window_size_left,      \
+              window_size_right, stream);                                     \
+        } else {                                                              \
+          LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP8_E4M3); \
+        }                                                                     \
+        break;                                                                \
+      case flash_v100::KV_CACHE_DTYPE_FP8_E5M2:                               \
+        LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP8_E5M2);   \
+        break;                                                                \
+      default:                                                                \
+        TORCH_CHECK(false, "Unsupported kv_cache_dtype: ", kv_cache_dtype);   \
+    }                                                                         \
   } while (0)
 
 #define LAUNCH_BY_PARTITION(HDIM)                                           \
@@ -4599,8 +5148,11 @@ at::Tensor flash_attention_decode_paged_xqa(
               "Unsupported XQA decode partition_size: ", partition_size);
   TORCH_CHECK(launch_num_partitions > 0,
               "launch_num_partitions must be positive");
-  TORCH_CHECK(tmp_out.dtype() == torch::kFloat16,
-              "XQA decode tmp_out must be fp16");
+  const auto expected_partial_dtype =
+      kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ? torch::kFloat32
+                                                           : torch::kFloat16;
+  TORCH_CHECK(tmp_out.dtype() == expected_partial_dtype,
+              "XQA decode tmp_out must be fp32 for E4M3 KV and fp16 otherwise");
   TORCH_CHECK(tmp_out.size(0) >= q.size(0) && tmp_out.size(1) >= q.size(1) &&
                   tmp_out.size(2) >= launch_num_partitions &&
                   tmp_out.size(3) == q.size(2),
@@ -4621,20 +5173,23 @@ at::Tensor flash_attention_decode_paged_xqa(
   TORCH_CHECK(out.stride(-1) == 1, "out last dim must be contiguous");
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
-    const bool e4m3_batch_allowed =
-        q.size(0) > 1 && q.size(0) <= 16 && xqa_e4m3_batch_enabled();
+    const bool e4m3_batch_allowed = q.size(0) > 1 && xqa_e4m3_batch_enabled();
+    const bool e4m3_aligned_page = k_cache.size(1) >= 256 &&
+                                   k_cache.size(1) % 16 == 0 &&
+                                   k_cache.size(2) == 1;
     const bool use_large_partition =
         q.size(0) == 1 &&
         (partition_size == 512 || partition_size == 896 ||
          partition_size == 1024 || partition_size == 1664) &&
-        k_cache.size(1) == 1568 && k_cache.size(2) == 1;
+        e4m3_aligned_page;
     TORCH_CHECK((q.size(0) == 1 || e4m3_batch_allowed) && q_per_kv == 6 &&
                     (partition_size == 64 || partition_size == 128 ||
                      partition_size == 256 || use_large_partition),
-                "E4M3 XQA supports B=1, or B=2..16 when "
+                "E4M3 XQA supports B=1, or B>=2 when "
                 "VLLM_FLASH_V100_E4M3_BATCH_XQA=1; q_per_kv=6 and D=256 are "
-                "required. Page-1568/Hkv=1 B1 additionally supports partition "
-                "sizes 512, 896, 1024, and 1664");
+                "required. A 16-aligned page with at least 256 tokens and "
+                "Hkv=1 additionally supports B1 partition sizes 512, 896, "
+                "1024, and 1664");
     const bool e4m3_batch_optimized =
         q.size(0) > 1 && xqa_e4m3_batch_optimized_enabled() &&
         k_cache.size(1) >= 256 && k_cache.size(1) % 16 == 0 &&
@@ -4703,17 +5258,18 @@ at::Tensor flash_attention_decode_paged_xqa(
     }                                                                          \
   } while (0)
 
-    const bool use_p64_p256_auto =
-        q.size(0) == 1 && partition_size == 64 && k_cache.size(1) == 1568 &&
-        k_cache.size(2) == 1 && !decode_partition_size_overridden() &&
-        xqa_e4m3_g6_p64_p256_auto_enabled();
-    constexpr int64_t kPage1568HeadDim256Elements = 1568 * 256;
+    const bool use_p64_p256_auto = q.size(0) == 1 && partition_size == 64 &&
+                                   e4m3_aligned_page &&
+                                   !decode_partition_size_overridden() &&
+                                   xqa_e4m3_g6_p64_p256_auto_enabled();
+    const int64_t page_head_dim_elements = k_cache.size(1) * 256;
     const bool fixed_interleaved_hkv1_layout =
+        (k_cache.size(1) == 800 || k_cache.size(1) == 1568) &&
         k_cache.size(3) == 256 &&
-        k_cache.stride(0) == 2 * kPage1568HeadDim256Elements &&
+        k_cache.stride(0) == 2 * page_head_dim_elements &&
         k_cache.stride(1) == 256 && k_cache.stride(2) == 256 &&
         k_cache.stride(3) == 1 &&
-        v_cache.stride(0) == 2 * kPage1568HeadDim256Elements &&
+        v_cache.stride(0) == 2 * page_head_dim_elements &&
         v_cache.stride(1) == 256 && v_cache.stride(2) == 256 &&
         v_cache.stride(3) == 1;
     if (use_p64_p256_auto) {
@@ -4760,39 +5316,31 @@ at::Tensor flash_attention_decode_paged_xqa(
             v_scale, short_launch_num_partitions, false, 8, stream, p512_begin,
             p256_begin, 0, false);
         if (use_merged_wave_launch) {
-          if (fixed_interleaved_hkv1_layout) {
-            launch_flash_attention_decode_paged_xqa_e4m3_g6_page1568<
-                -1, kXQARouteWaveLongSeqLens, true>(
-                q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,
-                max_logits, exp_sums, active_num_partitions, softmax_scale,
-                k_scale, v_scale, wave_long_launch_num_partitions, stream,
-                p512_begin, p896_begin, p1664_begin, false);
-          } else {
-            launch_flash_attention_decode_paged_xqa_e4m3_g6_page1568<
-                -1, kXQARouteWaveLongSeqLens>(
-                q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,
-                max_logits, exp_sums, active_num_partitions, softmax_scale,
-                k_scale, v_scale, wave_long_launch_num_partitions, stream,
-                p512_begin, p896_begin, p1664_begin, false);
-          }
+          launch_flash_attention_decode_paged_xqa_e4m3_g6_page_dispatch<
+              -1, kXQARouteWaveLongSeqLens, true>(
+              q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,
+              max_logits, exp_sums, active_num_partitions, softmax_scale,
+              k_scale, v_scale, wave_long_launch_num_partitions, stream,
+              fixed_interleaved_hkv1_layout, p512_begin, p896_begin,
+              p1664_begin, false);
         } else {
-          launch_flash_attention_decode_paged_xqa_e4m3_g6_page1568<
+          launch_flash_attention_decode_paged_xqa_e4m3_g6_page_dispatch<
               512, kXQARouteRangeSeqLens>(
               q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,
               max_logits, exp_sums, active_num_partitions, softmax_scale,
-              k_scale, v_scale, p512_route_launch_num_partitions, stream,
+              k_scale, v_scale, p512_route_launch_num_partitions, stream, false,
               p512_begin, p896_begin, 0, false);
-          launch_flash_attention_decode_paged_xqa_e4m3_g6_page1568<
+          launch_flash_attention_decode_paged_xqa_e4m3_g6_page_dispatch<
               896, kXQARouteRangeSeqLens>(
               q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,
               max_logits, exp_sums, active_num_partitions, softmax_scale,
-              k_scale, v_scale, p896_route_launch_num_partitions, stream,
+              k_scale, v_scale, p896_route_launch_num_partitions, stream, false,
               p896_begin, p1664_begin, 0, false);
-          launch_flash_attention_decode_paged_xqa_e4m3_g6_page1568<
+          launch_flash_attention_decode_paged_xqa_e4m3_g6_page_dispatch<
               1664, kXQARouteLongSeqLens>(
               q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,
               max_logits, exp_sums, active_num_partitions, softmax_scale,
-              k_scale, v_scale, p1664_launch_num_partitions, stream,
+              k_scale, v_scale, p1664_launch_num_partitions, stream, false,
               p1664_begin, 0, 0, false);
         }
 
@@ -4804,11 +5352,12 @@ at::Tensor flash_attention_decode_paged_xqa(
   do {                                                                       \
     const size_t reduce_shared_mem =                                         \
         static_cast<size_t>(2 * (MAX_PARTITIONS)) * sizeof(float);           \
-    flash_attention_decode_reduce_kernel<256, PARTITION_SIZE, SEQ_ROUTE>     \
+    flash_attention_decode_reduce_kernel<256, PARTITION_SIZE, SEQ_ROUTE,     \
+                                         float>                              \
         <<<reduce_grid, reduce_block, reduce_shared_mem, stream>>>(          \
-            reinterpret_cast<const __half*>(tmp_out.data_ptr<at::Half>()),   \
-            max_logits.data_ptr<float>(), exp_sums.data_ptr<float>(),        \
-            seq_lens.data_ptr<int>(), active_num_partitions.data_ptr<int>(), \
+            tmp_out.data_ptr<float>(), max_logits.data_ptr<float>(),         \
+            exp_sums.data_ptr<float>(), seq_lens.data_ptr<int>(),            \
+            active_num_partitions.data_ptr<int>(),                           \
             reinterpret_cast<__half*>(out.data_ptr<at::Half>()), q.size(0),  \
             MAX_PARTITIONS, q.size(1), tmp_out.stride(0), tmp_out.stride(1), \
             tmp_out.stride(2), max_logits.stride(0), max_logits.stride(1),   \
@@ -4875,24 +5424,22 @@ at::Tensor flash_attention_decode_paged_xqa(
           exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
           short_launch_num_partitions, false, 8, stream, dual_cta_begin,
           p256_begin, 0, false);
-      launch_flash_attention_decode_paged_xqa_tc_256_wide<
-          256, 6, true, kXQATCG6DualCtaThreads, 2, 1568, false, false,
-          kXQARouteLongSeqLens, false, false, false,
-          flash_v100::KV_CACHE_DTYPE_FP8_E4M3, true>(
+      launch_flash_attention_decode_paged_xqa_e4m3_g6_page_dispatch<
+          256, kXQARouteLongSeqLens>(
           q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
           exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
-          p256_launch_num_partitions, false, 8, stream, dual_cta_begin, 0, 0,
+          p256_launch_num_partitions, stream, false, dual_cta_begin, 0, 0,
           false);
 
       const dim3 reduce_grid(q.size(0), q.size(1), 1);
       const dim3 reduce_block(kThreadsPerBlock);
       const size_t reduce_shared_mem =
           static_cast<size_t>(2 * reduce_num_partitions) * sizeof(float);
-      flash_attention_decode_reduce_kernel<256, 0>
+      flash_attention_decode_reduce_kernel<256, 0, kXQARouteAllSeqLens, float>
           <<<reduce_grid, reduce_block, reduce_shared_mem, stream>>>(
-              reinterpret_cast<const __half*>(tmp_out.data_ptr<at::Half>()),
-              max_logits.data_ptr<float>(), exp_sums.data_ptr<float>(),
-              seq_lens.data_ptr<int>(), active_num_partitions.data_ptr<int>(),
+              tmp_out.data_ptr<float>(), max_logits.data_ptr<float>(),
+              exp_sums.data_ptr<float>(), seq_lens.data_ptr<int>(),
+              active_num_partitions.data_ptr<int>(),
               reinterpret_cast<__half*>(out.data_ptr<at::Half>()), q.size(0),
               reduce_num_partitions, q.size(1), tmp_out.stride(0),
               tmp_out.stride(1), tmp_out.stride(2), max_logits.stride(0),
@@ -4928,25 +5475,25 @@ at::Tensor flash_attention_decode_paged_xqa(
           exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
           launch_num_partitions, false, 8, stream);
     } else if (q.size(0) == 1 && partition_size == 512) {
-      launch_flash_attention_decode_paged_xqa_e4m3_g6_page1568<512>(
+      launch_flash_attention_decode_paged_xqa_e4m3_g6_page_dispatch<512>(
           q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
           exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
-          launch_num_partitions, stream);
+          launch_num_partitions, stream, false);
     } else if (q.size(0) == 1 && partition_size == 896) {
-      launch_flash_attention_decode_paged_xqa_e4m3_g6_page1568<896>(
+      launch_flash_attention_decode_paged_xqa_e4m3_g6_page_dispatch<896>(
           q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
           exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
-          launch_num_partitions, stream);
+          launch_num_partitions, stream, false);
     } else if (q.size(0) == 1 && partition_size == 1024) {
-      launch_flash_attention_decode_paged_xqa_e4m3_g6_page1568<1024>(
+      launch_flash_attention_decode_paged_xqa_e4m3_g6_page_dispatch<1024>(
           q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
           exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
-          launch_num_partitions, stream);
+          launch_num_partitions, stream, false);
     } else if (q.size(0) == 1 && partition_size == 1664) {
-      launch_flash_attention_decode_paged_xqa_e4m3_g6_page1568<1664>(
+      launch_flash_attention_decode_paged_xqa_e4m3_g6_page_dispatch<1664>(
           q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,
           exp_sums, active_num_partitions, softmax_scale, k_scale, v_scale,
-          launch_num_partitions, stream);
+          launch_num_partitions, stream, false);
     } else if (partition_size == 64) {
       LAUNCH_E4M3_BATCH_XQA(64);
     } else if (partition_size == 128) {

@@ -6,6 +6,7 @@ import gc
 import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from copy import deepcopy
 from datetime import timedelta
 from types import NoneType
 from typing import TYPE_CHECKING, Any
@@ -155,6 +156,18 @@ class Worker(WorkerBase):
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         self._ple_offload_worker_handle: Any | None = None
+        self._ple_offload_spawn_config: VllmConfig | None = None
+        if envs.VLLM_SM70_QWEN38_HYBRID_PLE and not (
+            envs.VLLM_SM70_QWEN38_DUAL_COMPILE
+            and envs.VLLM_PLE_CPU_OFFLOAD
+            and envs.VLLM_PLE_DISK_OFFLOAD
+        ):
+            raise ValueError(
+                "VLLM_SM70_QWEN38_HYBRID_PLE requires dual compilation plus "
+                "PLE CPU and disk offload"
+            )
+        if envs.VLLM_PLE_DISK_OFFLOAD and not envs.VLLM_PLE_CPU_OFFLOAD:
+            raise ValueError("VLLM_PLE_DISK_OFFLOAD requires VLLM_PLE_CPU_OFFLOAD=1")
         self._ple_offload_enabled = self._has_ple_layers()
         if envs.VLLM_PLE_CPU_OFFLOAD:
             if self._ple_offload_enabled:
@@ -237,11 +250,27 @@ class Worker(WorkerBase):
             num_workers,
             ipc_addr,
         )
+        spawn_config = self._ple_offload_spawn_config or self.vllm_config
+        self._ple_offload_spawn_config = None
         self._ple_offload_worker_handle = PleOffloadWorker.make_process(
-            self.vllm_config,
+            spawn_config,
             num_workers,
             ipc_addr,
         )
+
+    def prepare_ple_offload_spawn(self) -> None:
+        """Freeze the small pre-load config used by delayed hybrid spawn."""
+        if (
+            not self._ple_offload_enabled
+            or self.rank != 0
+            or self.parallel_config.data_parallel_rank != 0
+        ):
+            return
+        # Model loading attaches local weight-loader closures to parameters.
+        # Those closures make the live config graph unpicklable under spawn.
+        # The offload process historically received the pre-load config, so
+        # retain that exact contract while delaying only process creation.
+        self._ple_offload_spawn_config = deepcopy(self.vllm_config)
 
     def wait_ple_offload_ready(self) -> None:
         if self._ple_offload_worker_handle is None:
@@ -498,6 +527,17 @@ class Worker(WorkerBase):
             logger.info(msg)
             return kv_cache_memory_bytes
 
+        # The first forward triggers torch.compile, and a cold compile (cache
+        # miss) is not steady-state serving: on a 27B NVFP4 model on a 48 GB
+        # card it added 1.85 GiB of torch peak (inductor autotuning, AOT
+        # export) and 0.64 GiB of non-torch memory on top of the forward
+        # itself, so the KV budget came out at 3.5 instead of 6.0 GiB and
+        # depended on the state of the compile cache. Warm the compiled
+        # graphs up first and measure the second forward. Memory the warm-up
+        # keeps allocated still counts: non-torch is measured against the
+        # init snapshot, and torch memory the warm-up left behind beyond the
+        # weights is added below as warmup_torch_residual.
+        self.model_runner.profile_run()
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(
@@ -526,10 +566,17 @@ class Worker(WorkerBase):
         profile_result.torch_peak_increase = (
             profile_torch_peak - profile_result.before_profile.torch_peak
         )
+        warmup_torch_residual = max(
+            0,
+            profile_result.before_profile.torch_memory
+            - self.init_snapshot.torch_memory
+            - profile_result.weights_memory,
+        )
         profile_result.non_kv_cache_memory = (
             profile_result.non_torch_increase
             + profile_result.torch_peak_increase
             + profile_result.weights_memory
+            + warmup_torch_residual
         )
 
         # On ROCm, cudagraph_memory_estimate is always 0 so this is a no-op.
@@ -1015,6 +1062,11 @@ class Worker(WorkerBase):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=num_scheduled_tokens_np.max(),
                     use_cascade_attn=False,  # TODO(lucas): Handle cascade attention
+                    force_uniform_decode=(
+                        self.model_runner._compute_force_uniform_decode(
+                            scheduler_output
+                        )
+                    ),
                 )
             )
             all_gather_tensors = {
