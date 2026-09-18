@@ -1,37 +1,37 @@
 # Estado del fork — SabaTech-dev/1Cat-vLLM
 
-> Última actualización: 2026-09-18 (campaña sabatech-sm70-qflash)
+> Última actualización: 2026-09-18 (inventario real de trabajo propio)
 
-## Nuestra posición de serving
+## NUESTRO TRABAJO EN ESTE FORK (inventario real)
 
-- **Prod sirve con el tag `v1.5.0`** (sha d8f42b3, 2026-09-02) = último release del upstream
-  1CatAI/1Cat-vLLM. Verificado en el venv de prod (/srv/benchmarks/1cat, dist-info 1.5.0).
-- Este fork org quedó **stale en 2026-08-31** (commits pre-release: "Record final SM70 wheel
-  API gate", "Restore FastAPI metrics compatibility") — SIN sincronizar con v1.5.0 ni con main.
+Este fork NO es un espejo pasivo — tiene trabajo propio sustantivo:
 
-## Estado del upstream (a la fecha)
+- **78 branches de trabajo**: agent/private-v100-dsv4-* (deterministic-fp8-tactics,
+  fused-fp16-aux, pp2tp4-followup, prescale-spec-match), agent/v100-audit-* (pr341-glm53,
+  pr346-dflash2-quality, pr361-qwen38-82t), codex/v100-dflash2-* (fp8-verify20,
+  grouped-q16-guard, labd-adaptive-quality, long-decay-wave, prefill-closure,
+  quality-audit), codex/v100-fix-pr344-fp13-default.
+- **2 PRs ABIERTOS al upstream** (sin merge, base vieja Aug 31 — requieren rebase a main):
+  - #435 build: restore SM70 (Volta) compilation — 3 csrc fixes
+  - #431 platform: disable custom all-reduce on SM70 (Volta) — TP2 was hit
+    (el MISMO fix que Redhatvale documentó como necesario en PCIe)
+- Logs de experimentos en root: SM70_FLASH_V100_QUALITY_EXPERIMENT_LOG_20260615.md,
+  SM70_MTP_OUTPUT_QUALITY_AUDIT_20260616.md.
 
-- main lleva ~2 semanas de fixes SM70 post-v1.5.0 sin cortar v1.6.0. El relevante para nosotros:
-  **#645 "Decouple the Mamba state grid from the KV block size"** — requisito para servir
-  híbridos GDN+MoE (qwen35moe, clase Qwen3.6-35B-A3B) vía vLLM.
-- `fused_moe` SM70 YA está en v1.5.0 (47 referencias de código) → **MoE puro soportado hoy**.
-  El hueco es solo el híbrido GDN.
+## ACLARACIÓN sobre "1 ahead / 696 behind"
 
-## Estrategia acordada
+Esa comparación es SOLO de la rama main (snapshot Aug 31 + nuestro FORK-STATUS.md docs).
+El trabajo real vive en las 78 branches y los PRs abiertos. main NO refleja el esfuerzo.
 
-1. Prod denso sigue en v1.5.0 (estable, sin acción).
-2. Trackear el changelog de **v1.6.0**: si trae #645, evaluar upgrade para serving de híbridos.
-3. Si servimos qwen35moe vía vLLM antes de v1.6.0 → build desde upstream main (o sincronizar
-   este fork) ese día, con las envs SM70 del rig (`tools/eval_nvfp4_prod.sh` de qflash).
-4. Sincronizar este fork con upstream al hacer cualquiera de las dos cosas anteriores.
+## PLAN
 
-## Números de referencia nuestros (2026-09-18, protocolo tg256/pp de Redhatvale)
+1. Rebasar #435 y #431 sobre upstream main (696 commits) y reclamar merge.
+2. Sincronizar main de este fork con upstream.
+3. Trackear v1.6.0 (contendría #645 Mamba-grid — requisito para híbridos qwen35moe vía vLLM).
 
-- Prod denso (lyf-vl fp8-q4km, 1.5.0): tg256 **59.6 avg / 60.2 peak** · prefill ~1050 t/s @572pt
-- NVFP4 QUASAR+dflash (single-stream): **124 tok/s** (2x el mejor stack documentado por terceros)
-- Multi-stream: 6 seqs x 262144 ctx verificado (W9), continuous batching ON.
+## Posición de serving (2026-09-18)
 
-## Notas de la caja
-
-- systemd: el unit `llama-vllm-star` cambió en disco — `daemon-reload` pendiente.
-- Duelo de toolkits: el motor qflash compila y pasa verbatim con CUDA 12.9.2 y 12.8.2.
+- Prod: v1.5.0 (último release), denso, health estable.
+- MoE híbrido vía vLLM: upstream main lo sirve YA (medido: single 91.2/101.0, 6-stream 392.3
+  agregados, ctx 32K TP2) — sync de este fork + build desde main el día que se active.
+- Benchmarks completos: repo sabatech-sm70-qflash, ROADMAP.md sección SERVING STACK.
