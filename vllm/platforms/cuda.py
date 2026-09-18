@@ -153,6 +153,11 @@ def _get_backend_priorities(
             ):
                 return [
                     AttentionBackendEnum.FLASH_ATTN_V100,
+                    # Self-contained Triton paged attention (sprint F1):
+                    # A/B candidate against FLASH_ATTN_V100. Only eligible
+                    # when explicitly selected or when the backends above
+                    # are invalid for the configuration.
+                    AttentionBackendEnum.TRITON_PAGED,
                     AttentionBackendEnum.TRITON_ATTN,
                     AttentionBackendEnum.FLEX_ATTENTION,
                     AttentionBackendEnum.TURBOQUANT,
@@ -486,6 +491,13 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def use_custom_allreduce(cls) -> bool:
+        # The custom all-reduce kernel is not supported on SM70 (Volta): with
+        # TP > 1 on V100 (PCIe or NVLink) it leads to non-converging piecewise
+        # CUDA-graph capture, decode throughput collapse, and Xid 62 faults on
+        # both GPUs. Returning False makes the parallel config fall back to
+        # NCCL, which is stable on this architecture.
+        if cls.has_device_capability(70) and not cls.has_device_capability(75):
+            return False
         return True
 
     @classmethod

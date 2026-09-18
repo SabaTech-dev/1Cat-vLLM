@@ -285,6 +285,40 @@ class FreeKVCacheBlockQueue:
             curr_block.prev_free_block = self.fake_free_list_head
         return ret
 
+    def popright_n(self, n: int) -> list[KVCacheBlock]:
+        """Pop the last n free blocks (most recently freed first) and reduce
+        num_free_blocks by n. Used for LIFO block reuse with prefix caching
+        disabled: freed blocks are re-allocated in reverse free order.
+
+        Args:
+            n: The number of blocks to pop.
+
+        Returns:
+            A list of n free blocks.
+        """
+        if n == 0:
+            return []
+        assert self.num_free_blocks >= n
+        self.num_free_blocks -= n
+
+        curr_block = self.fake_free_list_tail.prev_free_block
+        ret = []
+        for _ in range(n):
+            assert curr_block is not None
+            ret.append(curr_block)
+            last_block = curr_block
+            curr_block = curr_block.prev_free_block
+            last_block.prev_free_block = None
+            last_block.next_free_block = None
+
+        if curr_block is not None:
+            # The queue is not empty: connect the fake tail to the new last
+            # block.
+            self.fake_free_list_tail.prev_free_block = curr_block
+            curr_block.next_free_block = self.fake_free_list_tail
+        ret.reverse()
+        return ret
+
     def remove(self, block: KVCacheBlock) -> None:
         """Remove a block in the free list and reduce num_free_blocks by 1.
 
