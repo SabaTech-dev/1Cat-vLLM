@@ -21,7 +21,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_sliding_window,
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
@@ -125,8 +125,7 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
-        block_reuse_order: str = "fifo",
-        watermark: float = 0.0,
+        prefix_cache_retention_interval: int | None = None,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -155,16 +154,13 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
-            block_reuse_order=block_reuse_order,
+        )
+        self.coordinator.configure_prefix_cache_retention(
+            prefix_cache_retention_interval
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
-
-        # Watermark: minimum number of KV cache blocks to keep free when
-        # admitting waiting/preempted requests, to avoid frequent preemptions.
-        assert watermark >= 0.0, "watermark must be non-negative"
-        self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
         self.kv_cache_event_metadata = tuple(
             (
                 get_kv_cache_spec_kind(group.kv_cache_spec).value,
@@ -219,6 +215,7 @@ class KVCacheManager:
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
+        request.shared_prefix_boundary = 0
         if not self.enable_caching or request.skip_reading_prefix_cache:
             return self.empty_kv_cache_blocks, 0
 
@@ -234,6 +231,10 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+
+        # Keep the existing two-value lookup API used by 1Cat connectors. The
+        # synchronous coordinator exposes the junction from this lookup only.
+        request.shared_prefix_boundary = self.coordinator.shared_prefix_boundary
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -256,7 +257,6 @@ class KVCacheManager:
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
         full_sequence_must_fit: bool = False,
-        has_scheduled_reqs: bool = True,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -356,15 +356,6 @@ class KVCacheManager:
             self.max_model_len,
         )
 
-        watermark_blocks = 0
-        # The watermark is applied to waiting/preempted requests only, and only
-        # when there's at least one request already scheduled.
-        if has_scheduled_reqs and request.status in (
-            RequestStatus.WAITING,
-            RequestStatus.PREEMPTED,
-        ):
-            watermark_blocks = self.watermark_blocks
-
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
             full_num_tokens = min(request.num_tokens, self.max_model_len)
@@ -378,8 +369,7 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
-            if required_blocks > self.block_pool.get_num_free_blocks():
+            if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -412,8 +402,7 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        if required_blocks > self.block_pool.get_num_free_blocks():
+        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
             # Cannot allocate new blocks
             return None
 

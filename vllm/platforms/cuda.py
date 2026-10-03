@@ -133,7 +133,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
-            if device_capability.major == 7 and device_capability.minor == 0:
+            if device_capability.major == 7 and device_capability.minor in (0, 2):
                 backends.insert(0, AttentionBackendEnum.GLM5_SM70_SPARSE)
             return backends
     else:
@@ -149,7 +149,7 @@ def _get_backend_priorities(
             if (
                 envs.VLLM_SM70_FLASH_ATTN_V100
                 and device_capability.major == 7
-                and device_capability.minor == 0
+                and device_capability.minor in (0, 2)
             ):
                 return [
                     AttentionBackendEnum.FLASH_ATTN_V100,
@@ -161,6 +161,16 @@ def _get_backend_priorities(
                     AttentionBackendEnum.TRITON_ATTN,
                     AttentionBackendEnum.FLEX_ATTENTION,
                     AttentionBackendEnum.TURBOQUANT,
+                ]
+            if device_capability.major == 7 and device_capability.minor == 5:
+                # Turing: FLASH_ATTN runs via the sm75 FA2 build (fp16-only,
+                # cmake/external_projects/vllm_flash_attn_sm75.cmake).
+                # FlashInfer's paged prefill fails with "invalid argument" on
+                # SM75; TRITON_ATTN stays as the fallback for non-fp16 models.
+                return [
+                    AttentionBackendEnum.FLASH_ATTN,
+                    AttentionBackendEnum.TRITON_ATTN,
+                    AttentionBackendEnum.FLEX_ATTENTION,
                 ]
             return [
                 AttentionBackendEnum.FLASH_ATTN,
@@ -223,7 +233,22 @@ class CudaPlatformBase(Platform):
         torch.cuda.manual_seed_all(seed)
 
     @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
+    def resolve_device_id(cls, device_id: int | None) -> int:
+        if device_id is not None:
+            return device_id
+        # A worker that has already selected its device (torch.cuda.set_device
+        # in init_device) answers for that device. A process without a CUDA
+        # context -- the engine core, the API server, a worker before device
+        # selection -- keeps index 0 of the visibility list, as before.
+        # is_initialized() only reports; it never creates a context.
+        if torch.cuda.is_initialized():
+            return torch.cuda.current_device()
+        return 0
+
+    @classmethod
+    def get_device_capability(
+        cls, device_id: int | None = None
+    ) -> DeviceCapability | None:
         raise NotImplementedError
 
     @classmethod
@@ -332,7 +357,12 @@ class CudaPlatformBase(Platform):
         attn_selector_config: AttentionSelectorConfig,
         num_heads: int | None = None,
     ) -> str:
-        device_capability = cls.get_device_capability()
+        # Heterogeneous PP: the backend must match THIS worker's GPU, not
+        # device 0 of the visibility list (an RTX stage and a V100 stage
+        # need different backends). Workers have set their device before
+        # any attention layer is built.
+        device_id = torch.cuda.current_device() if torch.cuda.is_initialized() else 0
+        device_capability = cls.get_device_capability(device_id)
         assert device_capability is not None
 
         # First try checking just the selected backend, if there is one.
@@ -662,9 +692,37 @@ class NvmlCudaPlatform(CudaPlatformBase):
         return super().device_id_to_physical_device_id(device_id)
 
     @classmethod
+    def get_device_capability(
+        cls, device_id: int | None = None
+    ) -> DeviceCapability | None:
+        # Resolve before the caches: they are keyed by the concrete index, so
+        # an unspecified device never freezes one process-wide answer.
+        device_id = cls.resolve_device_id(device_id)
+        # Once this process holds a CUDA context, torch is authoritative for
+        # the ordinal. NVML enumerates in PCI bus order while the CUDA runtime
+        # defaults to FASTEST_FIRST; on a node that mixes card generations the
+        # two orders differ unless CUDA_DEVICE_ORDER=PCI_BUS_ID is set. Reading
+        # torch after initialization cannot trigger the initialization that
+        # NvmlCudaPlatform exists to avoid, so NVML stays the pre-init path.
+        if torch.cuda.is_initialized():
+            return cls._torch_device_capability(device_id)
+        return cls._nvml_device_capability(device_id)
+
+    @classmethod
+    @cache
+    def _torch_device_capability(cls, device_id: int) -> DeviceCapability | None:
+        # Same contract as the NVML path: an unusable index answers None.
+        # torch raises AssertionError for an out-of-range ordinal.
+        try:
+            major, minor = torch.cuda.get_device_capability(device_id)
+        except (RuntimeError, AssertionError):
+            return None
+        return DeviceCapability(major=major, minor=minor)
+
+    @classmethod
     @cache
     @with_nvml_context
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
+    def _nvml_device_capability(cls, device_id: int) -> DeviceCapability | None:
         try:
             physical_device_id = cls.device_id_to_physical_device_id(device_id)
             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
@@ -678,7 +736,7 @@ class NvmlCudaPlatform(CudaPlatformBase):
     def has_device_capability(
         cls,
         capability: tuple[int, int] | int,
-        device_id: int = 0,
+        device_id: int | None = None,
     ) -> bool:
         try:
             return super().has_device_capability(capability, device_id)
@@ -733,8 +791,12 @@ class NvmlCudaPlatform(CudaPlatformBase):
 
     @classmethod
     def _get_physical_device_name(cls, device_id: int = 0) -> str:
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
-        return pynvml.nvmlDeviceGetName(handle)
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+            return pynvml.nvmlDeviceGetName(handle)
+        except pynvml.NVMLError:
+            # A failed diagnostic query must not abort platform initialization.
+            return f"<unavailable:{device_id}>"
 
     @classmethod
     @with_nvml_context
@@ -899,8 +961,12 @@ class NvmlCudaPlatform(CudaPlatformBase):
 
 class NonNvmlCudaPlatform(CudaPlatformBase):
     @classmethod
+    def get_device_capability(cls, device_id: int | None = None) -> DeviceCapability:
+        return cls._device_capability(cls.resolve_device_id(device_id))
+
+    @classmethod
     @cache
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability:
+    def _device_capability(cls, device_id: int) -> DeviceCapability:
         major, minor = torch.cuda.get_device_capability(device_id)
         return DeviceCapability(major=major, minor=minor)
 

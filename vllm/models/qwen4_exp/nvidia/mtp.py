@@ -19,12 +19,16 @@ import regex as re
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig, replace, set_current_vllm_config
+from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
+from vllm.config import SpeculativeConfig, VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -65,7 +69,12 @@ from .model import (
     _QWEN4_EXP_IGNORED_MISSING_SUFFIXES,
     Qwen4ExpDecoderLayer,
     Qwen4ExpMixtureOfExperts,
+    _make_qwen38_decode_compile_config,
 )
+from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
+from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
+
+logger = init_logger(__name__)
 
 
 def _remap_ignored_layers(
@@ -149,6 +158,35 @@ def _validate_mtp_expert_weights_loaded(
         )
 
 
+def _mtp_fp8_experts_supported(
+    draft_vllm_config: VllmConfig,
+    draft_quant_config: QuantizationConfig,
+    speculative_config: SpeculativeConfig,
+    exact_sm70: bool,
+    online_fp8: bool,
+) -> bool:
+    """Whether the SM70 FP8 MTP expert method can serve this draft.
+
+    Checkpoint FP8 experts are allowed under pipeline parallelism: the V2
+    runner builds the speculator only on the last pipeline rank, so the
+    drafter is stage-local and the FP8 expert padding follows that stage's
+    tensor-parallel size. Online conversion keeps the single-stage limit
+    until it is validated under pipeline parallelism as well.
+    """
+    return (
+        exact_sm70
+        and (
+            not online_fp8
+            or draft_vllm_config.parallel_config.pipeline_parallel_size == 1
+        )
+        and draft_vllm_config.model_config.dtype == torch.float16
+        and draft_quant_config.get_name()
+        in ("awq", "modelopt_fp4", "modelopt_mixed", "fp8")
+        and not draft_vllm_config.parallel_config.enable_expert_parallel
+        and speculative_config.rejection_sample_method == "standard"
+    )
+
+
 def _make_draft_vllm_config(
     vllm_config: VllmConfig,
     mtp_start_layer_idx: int,
@@ -188,6 +226,7 @@ def _make_draft_vllm_config(
     draft_vllm_config = replace(
         vllm_config,
         model_config=speculative_config.draft_model_config,
+        is_speculative_draft=True,
     )
     # VllmConfig post-init derives the target quant config, so restore the
     # independently resolved draft quant config after replacement.
@@ -207,20 +246,17 @@ def _make_draft_vllm_config(
         }
         checkpoint_prefixes = checkpoint_fp8_prefixes(draft_quant_config, prefixes)
     if online_fp8 or checkpoint_prefixes:
-        if (
-            not is_exact_sm70_cuda_platform()
-            or draft_vllm_config.model_config.dtype != torch.float16
-            or draft_quant_config is None
-            or draft_quant_config.get_name()
-            not in ("awq", "modelopt_fp4", "modelopt_mixed", "fp8")
-            or draft_vllm_config.parallel_config.pipeline_parallel_size != 1
-            or draft_vllm_config.parallel_config.enable_expert_parallel
-            or speculative_config.rejection_sample_method != "standard"
+        if draft_quant_config is None or not _mtp_fp8_experts_supported(
+            draft_vllm_config,
+            draft_quant_config,
+            speculative_config,
+            is_exact_sm70_cuda_platform(),
+            online_fp8,
         ):
             raise ValueError(
                 "MTP FP8 experts require SM70, FP16, an AWQ/ModelOpt/FP8 draft "
-                "checkpoint, tensor parallelism without PP or EP, and standard "
-                "rejection sampling"
+                "checkpoint, no expert parallelism, standard rejection sampling, "
+                "and pipeline-parallel size 1 for online conversion"
             )
         draft_quant_config = MTPExpertFp8Config(
             draft_quant_config,
@@ -271,6 +307,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             )
         }
         self.fp8_mtp_tp_size = draft_vllm_config.parallel_config.tensor_parallel_size
+        # Phase 2: the drafter shares the target cache_config; remember the main
+        # KV cache dtype so load_weights can finalize the draft QSA E4M3 scales.
+        self._kv_cache_dtype = draft_vllm_config.cache_config.cache_dtype
         with set_current_vllm_config(draft_vllm_config, prefix=prefix):
             # residual_linear_shared fusion: fc_embedding projects the token
             # embedding, fc_hidden (shared across HC branches) projects the
@@ -447,6 +486,49 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         "hidden_states": 0,
     }
 )
+class _Qwen4ExpMTPDecodeGraphModel(nn.Module):
+    """Small-shape compiled view sharing all drafter parameters and state."""
+
+    def __init__(
+        self,
+        *,
+        target_model: Qwen4ExpMultiTokenPredictor,
+        vllm_config: VllmConfig,
+    ) -> None:
+        super().__init__()
+        object.__setattr__(self, "_target_model", target_model)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+        return self._target_model.forward(
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx,
+        )
+
+
+@support_torch_compile(
+    # As on the target, selection between the two compiled backbones must
+    # remain outside the first, prefill-specialized compiled wrapper.
+    enable_if=lambda cfg: not envs.VLLM_SM70_QWEN38_DUAL_COMPILE,
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+        "hidden_states": 0,
+    },
+)
 class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     # Qwen4Exp repacks the small BF16/shared/MTP tensors separately from the
     # target experts and PLE tables. Loading the standalone drafter from that
@@ -509,6 +591,26 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         )
         self.set_moe_parameters(self.model.layers)
         enable_qwen4_exp_low_latency_gemm(self, vllm_config.model_config.dtype)
+        config_dtype = vllm_config.model_config.dtype
+        enable_qwen38_sm70_fp16_gemv(self, config_dtype, vllm_config)
+        enable_qwen38_sm70_fp16_fused_hc(self, config_dtype, vllm_config)
+        object.__setattr__(self, "_sm70_decode_graph_model", None)
+
+    def prepare_sm70_decode_graph_model(self) -> bool:
+        if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
+            return False
+        if self._sm70_decode_graph_model is None:
+            decode_config = _make_qwen38_decode_compile_config(self.vllm_config)
+            with set_current_vllm_config(decode_config):
+                decode_model = _Qwen4ExpMTPDecodeGraphModel(
+                    target_model=self.model, vllm_config=decode_config
+                )
+            object.__setattr__(self, "_sm70_decode_graph_model", decode_model)
+            logger.info_once(
+                "Prepared shared-weight SM70 Qwen3.8 MTP decode compiler; "
+                "supported draft shapes reuse the common FP16 GEMV/HC routes."
+            )
+        return True
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -522,7 +624,12 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
-        return self.model(
+        backbone = self.model
+        if envs.VLLM_SM70_QWEN38_DUAL_COMPILE and is_sm70_decode_graph_compiling():
+            backbone = self._sm70_decode_graph_model
+            if backbone is None:
+                raise RuntimeError("SM70 Qwen3.8 MTP decode compiler was not prepared")
+        return backbone(
             input_ids,
             positions,
             hidden_states,
@@ -540,6 +647,12 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor:
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+
+    def skip_checkpoint_weight(self, name: str) -> bool:
+        # The drafter ships inside its target's checkpoint; without this the
+        # loader reads the whole target again only for load_weights to drop
+        # everything but the MTP tensors.
+        return _remap_mtp_weight_name(name) is None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():
@@ -564,6 +677,18 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             )
         )
         _validate_mtp_expert_weights_loaded(self, loaded_weights)
+        # Phase 2: an E4M3 main KV cache makes the drafter's QSA layer E4M3 too.
+        # Finalize its calibrated k/v scales strictly from the checkpoint (no
+        # runtime fallback; missing names are listed). No-op for FP16/BF16 caches
+        # and on the PLE offload process (is_offload_process()).
+        from .model import _finalize_qsa_e4m3_scale_load
+
+        _finalize_qsa_e4m3_scale_load(
+            self,
+            loaded_weights,
+            self.model._kv_cache_dtype,
+            require_calibrated_speculative_draft=True,
+        )
         return loaded_weights
 
 

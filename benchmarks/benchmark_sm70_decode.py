@@ -440,19 +440,12 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY": os.environ.get(
             "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY"
         ),
-        "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING": os.environ.get(
-            "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING"
-        ),
         "awq_preserve_default_splits_effective": _env_bool(
             "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS",
             True,
         ),
         "awq_preserve_default_splits_only_effective": _env_bool(
             "VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY",
-            False,
-        ),
-        "allow_compile_cache_for_profiling_effective": _env_bool(
-            "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING",
             False,
         ),
         "VLLM_SM70_AWQ_DENSE_TUNE_MAX_M": os.environ.get(
@@ -899,10 +892,7 @@ def _sm70_graph_policy() -> dict[str, Any]:
         "VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN",
         True,
     )
-    flash_0dot3_benchmark_combo = _env_bool(
-        "VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL",
-        False,
-    )
+    flash_0dot3_benchmark_combo = False  # The retired alias never affected runtime.
     flash_0dot3_decode_only_capture = _env_bool(
         "VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE",
         False,
@@ -937,9 +927,6 @@ def _sm70_graph_policy() -> dict[str, Any]:
         ),
         "sm70_flash_v100_0dot3_eager_profile_effective": (
             flash_0dot3_compile and flash_0dot3_eager_profile
-        ),
-        "VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL": os.environ.get(
-            "VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL"
         ),
         "sm70_flash_v100_0dot3_benchmark_combo_kernel_requested": (
             flash_0dot3_benchmark_combo

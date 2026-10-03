@@ -232,10 +232,7 @@ from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_chang
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
-from vllm.v1.worker.cp_utils import (
-    check_attention_cp_compatibility,
-    get_total_cp_world_size,
-)
+from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
@@ -1668,6 +1665,7 @@ class GPUModelRunner(
         )
         self._init_block_sizes = [placeholder_block_size]
         self._init_kernel_block_sizes = [placeholder_block_size]
+        self._init_dcp_sharded = [True]
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             # We need to use the encoder length for encoder-decoder
@@ -1953,6 +1951,10 @@ class GPUModelRunner(
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
+        # Non-last PP rank under speculative decoding: this step's
+        # scheduler_output, kept until the sampled matrix arrives from the
+        # last rank in sample_tokens() (hybrid-state update).
+        self._pp_nonlast_scheduler_output: SchedulerOutput | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
@@ -2560,10 +2562,13 @@ class GPUModelRunner(
                         req_state.output_token_ids.extend(
                             new_token_ids[-num_new_tokens:]
                         )
-            elif num_output_tokens < len(req_state.output_token_ids):
+            if num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load
                 # failure, or output_token_ids was inflated by the optimistic
                 # extend above (async spec decode). Align the cached state.
+                # This runs on every pipeline rank: the optimistic extend is
+                # not gated on the rank either, and the deferred correction
+                # only fixes the token counts, never the placeholders.
                 del req_state.output_token_ids[num_output_tokens:]
                 if req_index is not None:
                     end_idx = (
@@ -5243,6 +5248,11 @@ class GPUModelRunner(
             ) in scheduler_output.scheduled_spec_decode_tokens.items():
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 draft_len = len(draft_token_ids)
+                # _calc_spec_decode_metadata places a request's sampled rows at
+                # [cumulative_end - (draft_len + 1), cumulative_end). Fewer
+                # query rows than that would silently select the preceding
+                # request's hidden states.
+                assert num_scheduled_tokens[req_idx] >= draft_len + 1
                 num_draft_tokens[req_idx] = draft_len
                 if (
                     self.input_batch.num_computed_tokens_cpu[req_idx]
@@ -5324,6 +5334,7 @@ class GPUModelRunner(
         ddtree_parent_metadata: DDTreeParentMetadata | None = None,
         cudagraph_capture_max_seq_len: int | None = None,
         cudagraph_graph_variant: int | None = None,
+        is_dummy_batch: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -5455,6 +5466,7 @@ class GPUModelRunner(
             max_seq_len=max_seq_len,
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
+            is_dummy_batch=is_dummy_batch,
             causal=True,
             cudagraph_graph_variant=cudagraph_graph_variant,
             is_prefilling=is_prefilling,
@@ -8889,6 +8901,7 @@ class GPUModelRunner(
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
                     self.kv_connector_output = kv_connector_output
+                    self._pp_nonlast_scheduler_output = scheduler_output
                     return hidden_states
 
                 if self.is_pooling_model:
@@ -9256,7 +9269,8 @@ class GPUModelRunner(
             # Therefore, here is no need to send sampled token ids again in this case.
             if not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank:
                 self._pp_broadcast_prev_sampled_token_ids(
-                    sampler_output.sampled_token_ids
+                    sampler_output.sampled_token_ids,
+                    sample_hidden_states if logits is None else logits,
                 )
 
         self._draft_token_ids = None
@@ -9458,6 +9472,15 @@ class GPUModelRunner(
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
 
+        if (
+            spec_config is not None
+            and self.use_async_scheduling
+            and not self.broadcast_pp_output
+            and get_pp_group().world_size > 1
+            and get_pp_group().is_last_rank
+        ):
+            self._pp_broadcast_draft_token_ids()
+
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
         # draft model to also save its KV cache.
@@ -9606,33 +9629,192 @@ class GPUModelRunner(
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(
-        self, sampled_token_ids: torch.Tensor
+        self, sampled_token_ids: torch.Tensor, sampler_input: torch.Tensor
     ) -> None:
-        """Broadcast sampled token ids (GPU) from last PP stage"""
+        """Broadcast sampled token ids (GPU) from last PP stage.
+
+        `sampler_input` is what the sampler drew from (logits, or the hidden
+        states when it computed the logits itself); only read to explain an
+        invalid sample."""
         pp = get_pp_group()
         assert pp.is_last_rank
+        # Skip for chunked prefill: sampled tokens are dummy
+        # and will be discarded, no need to broadcast.
+        if self._is_all_reqs_chunked_prefill():
+            return
+        # The receiver sizes its buffer from its own input_batch.num_reqs.
+        # Both come from the same scheduler output; a divergence has to raise
+        # here instead of hanging every rank in an unmatched collective.
+        assert sampled_token_ids.shape[0] == self.input_batch.num_reqs
+        if self.num_spec_tokens:
+            # Speculative decoding: the non-last ranks derive the next token
+            # ids, the accepted counts and the hybrid-state update from the
+            # full sampled matrix. The sampler emits fewer columns in rounds
+            # with fewer or no scheduled drafts, so pad to the static wire
+            # shape [num_reqs, num_spec_tokens + 1] with the rejection
+            # sampler's -1 placeholder.
+            payload = torch.full(
+                (sampled_token_ids.shape[0], self.num_spec_tokens + 1),
+                -1,
+                dtype=torch.int32,
+                device=sampled_token_ids.device,
+            )
+            payload[:, : sampled_token_ids.shape[1]] = sampled_token_ids
+            payload_cpu = payload.cpu()
+            self._pp_check_token_ids(
+                "sampled",
+                payload_cpu,
+                skip_discarded=True,
+                sampler_input=sampler_input,
+            )
+            # The speculative round state goes over the gloo cpu_group. An
+            # NCCL broadcast on the device_group shares the communicator with
+            # the pipeline's send/recv; with five stages the two interleave
+            # and the first request hangs (ranks 0-2 in the broadcast, ranks
+            # 3-4 in irecv). A CPU rendezvous has no stream ordering to
+            # violate, and the payload is [num_reqs, num_spec_tokens + 1]
+            # int32.
+            torch.distributed.broadcast(payload_cpu, src=pp.rank, group=pp.cpu_group)
+            return
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
         assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
             "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
         )
-        # Skip for chunked prefill: sampled tokens are dummy
-        # and will be discarded, no need to broadcast.
-        if not self._is_all_reqs_chunked_prefill():
-            torch.distributed.broadcast(
-                sampled_token_ids, src=pp.rank, group=pp.device_group
+        torch.distributed.broadcast(
+            sampled_token_ids, src=pp.rank, group=pp.device_group
+        )
+
+    def _pp_broadcast_draft_token_ids(self) -> None:
+        """Broadcast this step's draft token ids from the last PP stage.
+
+        Under async scheduling the scheduler only carries placeholder draft
+        slots; the non-last ranks need the real draft ids for their
+        input_ids scatter in the next step.
+        """
+        pp = get_pp_group()
+        assert pp.is_last_rank
+        if self._is_all_reqs_chunked_prefill():
+            return
+        num_reqs = self.input_batch.num_reqs
+        drafts = self._draft_token_ids
+        if isinstance(drafts, torch.Tensor) and drafts.shape[0] >= num_reqs:
+            payload = drafts[:num_reqs].to(dtype=torch.int32).contiguous()
+        else:
+            # Drafter skipped, or list-form drafts (ngram): the scheduler
+            # schedules no GPU-resident spec slots from these, so the zeros
+            # are never read on the receiving rank.
+            payload = torch.zeros(
+                (num_reqs, self.num_spec_tokens),
+                dtype=torch.int32,
+                device=self.device,
             )
+        payload_cpu = payload.cpu()
+        self._pp_check_token_ids("draft", payload_cpu, skip_discarded=False)
+        torch.distributed.broadcast(payload_cpu, src=pp.rank, group=pp.cpu_group)
+
+    def _pp_check_token_ids(
+        self,
+        kind: str,
+        token_ids: torch.Tensor,
+        skip_discarded: bool,
+        sampler_input: torch.Tensor | None = None,
+    ) -> None:
+        """Token ids the last PP stage hands to the others feed their embedding
+        lookup. An id outside the vocabulary would surface there as an
+        anonymous device-side assert that takes the engine down, so check the
+        payload while it is in host memory anyway: on the last stage before it
+        is sent (where the cause can still be named), and on arrival. A
+        discarded request's sampled token is never read."""
+        invalid = (token_ids < 0) | (token_ids >= self.input_batch.vocab_size)
+        if kind == "sampled":
+            # Only the contiguous accepted prefix is consumed. Later -1
+            # entries are padding; an active request still needs a first token.
+            consumed = (token_ids != -1).to(torch.int32).cumprod(dim=1).bool()
+            invalid &= consumed
+            invalid[:, 0] |= token_ids[:, 0] < 0
+        if skip_discarded:
+            num_reqs = token_ids.shape[0]
+            discarded = torch.from_numpy(self.discard_request_mask.np[:num_reqs])
+            invalid &= ~discarded[:, None]
+        if invalid.any():
+            num_reqs = token_ids.shape[0]
+            cause = ""
+            if sampler_input is not None:
+                metadata = self.input_batch.sampling_metadata
+                temperature = metadata.temperature
+                cause = (
+                    f"; non-finite values per sampler input row "
+                    f"{(~torch.isfinite(sampler_input)).sum(dim=-1).tolist()} of "
+                    f"{tuple(sampler_input.shape)}, all_greedy={metadata.all_greedy}, "
+                    f"all_random={metadata.all_random}, temperature="
+                    f"{None if temperature is None else temperature.tolist()}, "
+                    f"num_computed_tokens="
+                    f"{self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist()}, "
+                    f"step input_ids="
+                    f"{self.input_ids.gpu[: sampler_input.shape[0]].tolist()}, "
+                    f"positions={self.positions[: sampler_input.shape[0]].tolist()}"
+                )
+            raise RuntimeError(
+                f"PP spec decode: invalid {kind} token ids from the last stage: "
+                f"{token_ids.tolist()} for requests "
+                f"{self.input_batch.req_ids[:num_reqs]}, discarded="
+                f"{self.discard_request_mask.np[:num_reqs].tolist()}{cause}"
+            )
+
+    def _pp_receive_spec_decode_state(self, num_reqs: int) -> None:
+        """Receive the speculative round state from the last PP stage.
+
+        Wire format, two broadcasts of statically known shape:
+          1. the sampled token matrix [num_reqs, num_spec_tokens + 1], -1 padded
+          2. the draft token ids [num_reqs, num_spec_tokens]
+        The next token ids, the accepted counts and the hybrid (GDN/mamba)
+        state update are derived locally from the matrix, as the last rank
+        does in its full sample_tokens() path.
+        """
+        pp = get_pp_group()
+        sampled_cpu = torch.empty(
+            (num_reqs, self.num_spec_tokens + 1), dtype=torch.int32
+        )
+        torch.distributed.broadcast(sampled_cpu, src=pp.last_rank, group=pp.cpu_group)
+        self._pp_check_token_ids("sampled", sampled_cpu, skip_discarded=True)
+        sampled = sampled_cpu.to(self.device, non_blocking=True)
+        valid_counts = _count_contiguous_spec_tokens(sampled)
+        next_token_ids = sampled.gather(
+            1, (valid_counts.to(torch.int64) - 1).clamp_(min=0).unsqueeze(1)
+        ).squeeze(1)
+        assert self.valid_sampled_token_count_event is not None
+        self._copy_valid_sampled_token_count(next_token_ids, valid_counts)
+
+        drafts_cpu = torch.empty((num_reqs, self.num_spec_tokens), dtype=torch.int32)
+        torch.distributed.broadcast(drafts_cpu, src=pp.last_rank, group=pp.cpu_group)
+        self._pp_check_token_ids("draft", drafts_cpu, skip_discarded=False)
+        self._draft_token_ids = drafts_cpu.to(self.device, non_blocking=True)
+
+        scheduler_output = self._pp_nonlast_scheduler_output
+        self._pp_nonlast_scheduler_output = None
+        if scheduler_output is None:
+            raise RuntimeError(
+                "PP speculative decoding: this non-last rank has no stashed "
+                "scheduler_output for the hybrid-state update."
+            )
+        self._update_states_after_model_execute(sampled, scheduler_output)
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
         pp = get_pp_group()
         assert not pp.is_last_rank
         num_reqs = self.input_batch.num_reqs
-        # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
-        recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
-        # skip for chunked prefill.
-        if not self._is_all_reqs_chunked_prefill():
-            torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
-        self.input_batch.prev_sampled_token_ids = recv
+        if self.num_spec_tokens and not self._is_all_reqs_chunked_prefill():
+            self._pp_receive_spec_decode_state(num_reqs)
+        else:
+            # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
+            recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
+            # skip for chunked prefill.
+            if not self._is_all_reqs_chunked_prefill():
+                torch.distributed.broadcast(
+                    recv, src=pp.last_rank, group=pp.device_group
+                )
+            self.input_batch.prev_sampled_token_ids = recv
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
         # can map req_id -> previous batch row
@@ -11024,6 +11206,7 @@ class GPUModelRunner(
                     max_query_len=max_query_len,
                     ubatch_slices=(ubatch_slices_padded if pad_attn else ubatch_slices),
                     for_cudagraph_capture=build_for_capture,
+                    is_dummy_batch=True,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
                     ddtree_parent_metadata=dummy_ddtree_parent_metadata,
@@ -11098,12 +11281,16 @@ class GPUModelRunner(
             elif self.uses_xdrope_dim > 0:
                 positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
+                # A dummy batch can hold more tokens than one sequence may
+                # (max_num_batched_tokens > max_model_len); wrap so every
+                # position stays inside the model's position table.
                 self.positions[:num_tokens_padded].copy_(
                     torch.arange(
                         num_tokens_padded,
                         dtype=torch.int64,
                         device=self.device,
                     )
+                    % self.max_model_len
                 )
                 positions = self.positions[:num_tokens_padded]
 
@@ -12331,17 +12518,23 @@ class GPUModelRunner(
         """
         block_sizes = []
         max_num_blocks = []
+        dcp_sharded = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
             block_size = kv_cache_group.kv_cache_spec.block_size
             block_sizes.append(block_size)
+            dcp_sharded.append(kv_cache_group.kv_cache_spec.dcp_sharded)
             if isinstance(kv_cache_group.kv_cache_spec, CircularBufferSpec):
                 max_num_blocks_per_req = 1
             else:
                 max_num_blocks_per_req = cdiv(
-                    max_model_len, block_size * get_total_cp_world_size()
+                    max_model_len,
+                    kv_cache_group.kv_cache_spec.global_block_size(
+                        self.dcp_world_size,
+                        self.parallel_config.prefill_context_parallel_size,
+                    ),
                 )
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 max_num_blocks_per_req = (
@@ -12354,9 +12547,11 @@ class GPUModelRunner(
         if (
             block_sizes != self._init_block_sizes
             or kernel_block_sizes != self._init_kernel_block_sizes
+            or dcp_sharded != self._init_dcp_sharded
         ):
             self._init_block_sizes = block_sizes
             self._init_kernel_block_sizes = kernel_block_sizes
+            self._init_dcp_sharded = dcp_sharded
             self.input_batch = InputBatch(
                 max_num_reqs=self.max_num_reqs,
                 max_model_len=max_model_len,
@@ -12366,6 +12561,7 @@ class GPUModelRunner(
                 vocab_size=self.model_config.get_vocab_size(),
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
+                dcp_sharded=dcp_sharded,
                 max_num_blocks_per_req=max_num_blocks,
                 num_spec_tokens=self.num_spec_tokens,
                 logitsprocs=self.input_batch.logitsprocs,
@@ -12382,6 +12578,7 @@ class GPUModelRunner(
             f"InputBatch kernel_block_sizes {self._init_kernel_block_sizes} "
             f"!= kv_cache kernel_block_sizes {kernel_block_sizes}"
         )
+        assert self._init_dcp_sharded == dcp_sharded
 
     def _allocate_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig
@@ -12602,6 +12799,10 @@ class GPUModelRunner(
             Dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
+        if any(t.packed_members for t in kv_cache_config.kv_cache_tensors):
+            raise NotImplementedError(
+                "Packed attention pages are laid out only by the v2 GPU model runner"
+            )
 
         # Try creating KV caches optimized for kv-connector transfers
         cache_dtype = self.cache_config.cache_dtype

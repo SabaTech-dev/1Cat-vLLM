@@ -56,6 +56,7 @@ from vllm.models.deepseek_v4.sm70.gemv import (
     maybe_sm70_dsv4_fp16_gemv,
     maybe_sm70_dsv4_fused_fp16_aux_gemv,
     prepare_sm70_dsv4_fused_fp16_aux_weight,
+    sm70_fused_fp16_aux_reason,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -100,8 +101,13 @@ def _fill_short_context_topk_indices(
     )
 
 
-def _is_exact_sm70_cuda() -> bool:
-    return current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+def _is_volta_or_turing_cuda() -> bool:
+    # Both lack BF16, FP8 and FlashMLA, so Turing takes the SM70 route too. Its
+    # kernels are Triton with software FP8; the TurboMind-backed pieces it calls
+    # keep their own exact-SM70 checks.
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        70
+    )
 
 
 def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
@@ -112,7 +118,7 @@ def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
         )
 
         return DeepseekV4ROCMAiterMLASparseImpl
-    if _is_exact_sm70_cuda():
+    if _is_volta_or_turing_cuda():
         from vllm.models.deepseek_v4.sm70.sparse import (
             DeepseekV4SM70SparseImpl,
         )
@@ -189,7 +195,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        self._use_sm70_path = _is_exact_sm70_cuda()
+        self._use_sm70_path = _is_volta_or_turing_cuda()
         self.n_local_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
@@ -315,7 +321,16 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 k_cache_prefix=self.mla_attn.prefix,
                 validity_cache_prefix=self.swa_cache_layer.prefix,
             )
-        self.register_buffer("_sm70_dsv4_fused_fp16_aux_weight", None, persistent=False)
+        self._fused_fp16_aux_kernel_config = mla_modules.vllm_config.kernel_config
+        self._fused_fp16_aux_policy = (
+            mla_modules.vllm_config.kernel_config.fused_fp16_aux_gemv
+        )
+        self._sm70_fused_fp16_aux_enabled = False
+        self._sm70_fused_fp16_aux_rows = (0, 0, 0)
+        self._sm70_fused_fp16_aux_reason = "not_prepared"
+        self.register_buffer(
+            "_sm70_fused_fp16_aux_packed_weight", None, persistent=False
+        )
 
     def forward(
         self,
@@ -402,18 +417,36 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         return self.wo_b(z.flatten(1))
 
     def prepare_sm70_fused_fp16_aux_weight(self) -> None:
-        """Join the three exact C4 weights once, after checkpoint loading."""
-        if self.compressor is None or self.indexer is None:
-            return
-        fused_weight = prepare_sm70_dsv4_fused_fp16_aux_weight(
-            (
+        """Fuse existing exact projections without changing their reduction."""
+        reason: str | None = "requires_compressor_and_indexer"
+        self._buffers["_sm70_fused_fp16_aux_packed_weight"] = None
+        self._sm70_fused_fp16_aux_rows = (0, 0, 0)
+        if self.compressor is not None and self.indexer is not None:
+            weights = (
                 self.compressor.fused_wkv_wgate.weight,
                 self.indexer.compressor.fused_wkv_wgate.weight,
                 self.indexer.weights_proj.weight,
             )
+            # Capability is independent of the user policy. Otherwise the
+            # disabled arm could alias a graph compiled with fusion enabled.
+            applicable = sm70_fused_fp16_aux_reason(weights, enabled=True) is None
+            if applicable:
+                self._fused_fp16_aux_kernel_config.fused_fp16_aux_gemv_applicable = True
+            reason = sm70_fused_fp16_aux_reason(
+                weights, enabled=self._fused_fp16_aux_policy
+            )
+            if reason is None:
+                packed = prepare_sm70_dsv4_fused_fp16_aux_weight(
+                    weights, enabled=self._fused_fp16_aux_policy
+                )
+                assert packed is not None
+                self._buffers["_sm70_fused_fp16_aux_packed_weight"] = packed
+                self._sm70_fused_fp16_aux_rows = tuple(w.shape[0] for w in weights)
+        self._sm70_fused_fp16_aux_enabled = reason is None
+        self._sm70_fused_fp16_aux_reason = reason or "admitted"
+        logger.info_once(
+            "SM70 exact FP16 auxiliary fusion: %s", self._sm70_fused_fp16_aux_reason
         )
-        if fused_weight is not None:
-            self._buffers["_sm70_dsv4_fused_fp16_aux_weight"] = fused_weight
 
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
         aux_streams = self.aux_stream_list
@@ -499,14 +532,14 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             qr_kv, _ = self.fused_wqa_wkv(hidden_states)
             return qr_kv
 
-        fused_aux_weight = self._sm70_dsv4_fused_fp16_aux_weight
+        fused_aux_weight = self._sm70_fused_fp16_aux_packed_weight
         if aux_streams is not None and can_use_sm70_dsv4_fused_fp16_aux_gemv(
-            hidden_states, fused_aux_weight
+            hidden_states, fused_aux_weight, self._sm70_fused_fp16_aux_rows
         ):
 
             def fused_fp16_aux() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
                 result = maybe_sm70_dsv4_fused_fp16_aux_gemv(
-                    hidden_states, fused_aux_weight
+                    hidden_states, fused_aux_weight, self._sm70_fused_fp16_aux_rows
                 )
                 assert result is not None
                 return result

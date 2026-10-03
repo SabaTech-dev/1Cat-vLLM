@@ -109,20 +109,22 @@ def _qwen4_moe_contract(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_mixed_min_capability_requires_exact_sm70_and_both_turbomind_routes():
+def test_mixed_min_capability_requires_pre_ampere_and_both_turbomind_routes():
+    # Volta takes the TurboMind routes, Turing the QPN routes; both admit the
+    # mixed checkpoint when the FP8 and NVFP4 switches are on.
     with (
-        patch.object(sm70_tm, "is_exact_sm70_cuda_platform", return_value=True),
+        patch.object(sm70_tm, "is_pre_ampere_cuda_platform", return_value=True),
         patch.object(sm70_tm, "use_turbomind", side_effect=[True, True]),
     ):
         assert ModelOptMixedPrecisionConfig.get_min_capability() == 70
 
     with (
-        patch.object(sm70_tm, "is_exact_sm70_cuda_platform", return_value=True),
+        patch.object(sm70_tm, "is_pre_ampere_cuda_platform", return_value=True),
         patch.object(sm70_tm, "use_turbomind", side_effect=[True, False]),
     ):
         assert ModelOptMixedPrecisionConfig.get_min_capability() == 89
 
-    with patch.object(sm70_tm, "is_exact_sm70_cuda_platform", return_value=False):
+    with patch.object(sm70_tm, "is_pre_ampere_cuda_platform", return_value=False):
         assert ModelOptMixedPrecisionConfig.get_min_capability() == 89
 
 
@@ -397,7 +399,7 @@ def test_qwen38_qpn_batch_fused_w2_defaults_on_and_is_shape_gated(monkeypatch, t
     assert not _use_qwen38_qpn_batch_fused_w2(layer, x, topk_ids)
 
 
-def test_qwen38_qpn_mtp5_decode_is_opt_in_and_exact_shape_only(monkeypatch):
+def test_qwen38_qpn_mtp5_decode_defaults_on_and_exact_shape_only(monkeypatch):
     layer = SimpleNamespace(
         moe_config=_qwen4_moe_contract(),
         sm70_nvfp4_num_experts=512,
@@ -409,6 +411,9 @@ def test_qwen38_qpn_mtp5_decode_is_opt_in_and_exact_shape_only(monkeypatch):
     topk_ids = torch.empty(5, 10, dtype=torch.int32)
 
     monkeypatch.delenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", raising=False)
+    assert _use_qwen38_qpn_mtp5_decode(layer, x, topk_ids)
+
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "0")
     assert not _use_qwen38_qpn_mtp5_decode(layer, x, topk_ids)
 
     monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE", "1")

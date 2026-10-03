@@ -267,8 +267,7 @@ class Scheduler(SchedulerInterface):
             pcp_world_size=self.pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
-            block_reuse_order=self.cache_config.block_reuse_order,
-            watermark=self.scheduler_config.watermark,
+            prefix_cache_retention_interval=self.cache_config.prefix_cache_retention_interval,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -291,17 +290,40 @@ class Scheduler(SchedulerInterface):
         # the Mamba group's own block grid. The global cache block size can be
         # much smaller in heterogeneous layouts (Qwen3.8 uses 16-token hashes
         # with an 816-token recurrent-state block), so it is not a valid grid.
-        mamba_state_block_sizes = {
-            group.kv_cache_spec.block_size
+        mamba_specs = [
+            group.kv_cache_spec
             for group in kv_cache_config.kv_cache_groups
             if isinstance(group.kv_cache_spec, MambaSpec)
-        }
+        ]
+        mamba_state_block_sizes = {spec.block_size for spec in mamba_specs}
         assert len(mamba_state_block_sizes) <= 1, (
             "mamba align scheduling requires a single state block size, "
             f"got {sorted(mamba_state_block_sizes)}"
         )
         self.mamba_state_block_size = (
             next(iter(mamba_state_block_sizes)) if mamba_state_block_sizes else None
+        )
+        # Sparse admission only retains replay/shared-prefix and periodic
+        # boundaries. Materializing discarded states must not split the whole
+        # model's prefill into one-state-block forwards. Mixed alignments still
+        # use dense admission in MambaManager, so keep their dense scheduling.
+        coordinator = self.kv_cache_manager.coordinator
+        self.mamba_state_retention_interval = (
+            self.cache_config.prefix_cache_retention_interval
+            if self.need_mamba_block_aligned_split
+            and all(spec.mamba_cache_mode == "align" for spec in mamba_specs)
+            and getattr(coordinator, "lcm_block_size", self.mamba_state_block_size)
+            == self.mamba_state_block_size
+            else None
+        )
+        # Full-chunk recurrent states need dense boundaries under contention
+        # to preserve concurrent decode throughput. A lone request still uses
+        # sparse replay boundaries: forcing dense admission there changes its
+        # prefix reuse and regresses speculative acceptance on warm repeats.
+        self.mamba_dense_boundaries_on_contention = (
+            self.mamba_state_retention_interval is not None
+            and self.mamba_state_block_size is not None
+            and self.mamba_state_block_size >= self.max_num_scheduled_tokens
         )
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
@@ -458,14 +480,36 @@ class Scheduler(SchedulerInterface):
             if aligned_end > start:
                 end = aligned_end
 
-        # The align allocator materializes one recurrent-state column per
-        # scheduler step. A step spanning multiple state blocks leaves the
-        # interior slots null, so every crossed boundary must end a chunk.
-        next_block_boundary = (start // block_size + 1) * block_size
+        # The align allocator only materializes the state at the chunk end.
+        # Stop at every *retained* boundary so none is admitted with a null
+        # state, while batching across the discarded interior states.
+        retention_interval = getattr(self, "mamba_state_retention_interval", None)
+        if getattr(self, "mamba_dense_boundaries_on_contention", False) and (
+            len(self.running) + len(self.waiting) > 1
+        ):
+            retention_interval = None
+        if retention_interval is None:
+            retained_boundaries = [(start // block_size + 1) * block_size]
+        else:
+            retained_boundaries = list(
+                self.kv_cache_manager.coordinator.get_replay_boundaries(
+                    request, block_size
+                )
+            )
+            if retention_interval:
+                retained_boundaries.append(
+                    (start // retention_interval + 1) * retention_interval
+                )
         end = min(
             (
                 stop
-                for stop in (next_block_boundary, last_cache_position)
+                for stop in (
+                    *retained_boundaries,
+                    last_cache_position,
+                    getattr(request, "shared_prefix_boundary", 0)
+                    // block_size
+                    * block_size,
+                )
                 if start < stop < end
             ),
             default=end,
@@ -666,7 +710,6 @@ class Scheduler(SchedulerInterface):
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
-                        has_scheduled_reqs=bool(self.running),
                     )
 
                     if new_blocks is not None:

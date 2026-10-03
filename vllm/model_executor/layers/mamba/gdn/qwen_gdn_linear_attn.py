@@ -17,6 +17,10 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config.sm70_dflash2 import (
+    capture_sm70_dflash2_config,
+    sm70_dflash2_enabled,
+)
 from vllm.distributed import (
     divide,
 )
@@ -39,6 +43,7 @@ from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    LinearBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
@@ -2454,7 +2459,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV
         )
         self.enable_sm70_dflash2_fused_gdn_verify = bool(
-            envs.VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY
+            sm70_dflash2_enabled(
+                "fused_gdn_verify", capture_sm70_dflash2_config(vllm_config)
+            )
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
@@ -2464,22 +2471,46 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and envs.VLLM_SM70_DFLASH2_TP2_GDN_BV2
         )
         self.enable_sm70_dflash2_fused_gdn_norm = bool(
-            envs.VLLM_SM70_DFLASH2_FUSED_GDN_NORM
+            sm70_dflash2_enabled(
+                "fused_gdn_norm", capture_sm70_dflash2_config(vllm_config)
+            )
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
         self.enable_sm70_dflash2_fused_gdn_split = bool(
-            envs.VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT
+            sm70_dflash2_enabled(
+                "fused_gdn_split", capture_sm70_dflash2_config(vllm_config)
+            )
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
         self.enable_sm70_dflash2_fused_gdn_combined_split = bool(
-            envs.VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT
+            sm70_dflash2_enabled(
+                "fused_gdn_combined_split", capture_sm70_dflash2_config(vllm_config)
+            )
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
-            and self.tp_size == 4
-            and self.hidden_size == 5120
         )
+        self._sm70_dflash2_combined_split_reason = (
+            None
+            if self.enable_sm70_dflash2_fused_gdn_combined_split
+            else "policy_hardware_or_speculation"
+        )
+        if self.enable_sm70_dflash2_fused_gdn_combined_split:
+            from vllm.model_executor.models.qwen3_5 import (
+                _can_implement_sm70_combined_gdn_split,
+            )
+
+            (
+                self.enable_sm70_dflash2_fused_gdn_combined_split,
+                self._sm70_dflash2_combined_split_reason,
+            ) = _can_implement_sm70_combined_gdn_split(
+                8,
+                torch.float16,
+                (2 * self.key_dim + self.value_dim) // self.tp_size,
+                self.value_dim // self.tp_size,
+                self.num_v_heads // self.tp_size,
+            )
         self.enable_sm70_dflash2_fused_qkv_pack = bool(
             envs.VLLM_SM70_DFLASH2_FUSED_QKV_PACK
             and current_platform.is_device_capability(70)
@@ -4255,6 +4286,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         use_qwen38_fused_input = bool(
             getattr(self, "sm70_qwen38_fp16_fused_input", False)
+            # A LoRA wrapper owns additional projection work. Only bypass plain
+            # linears; other layers still benefit from their base GEMV method.
+            and isinstance(self.in_proj_qkvz, LinearBase)
+            and isinstance(self.in_proj_ba, LinearBase)
             and use_sm70_decode_graph_semantics()
             and not _sm70_gdn_projection_dump_requested(layer_name)
         )
@@ -4264,6 +4299,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 hidden_states,
                 self.in_proj_qkvz.weight,
                 self.in_proj_ba.weight,
+                getattr(self.in_proj_qkvz, "_sm70_qwen38_gdn_packed", None),
+                getattr(self.in_proj_ba, "_sm70_qwen38_gdn_packed", None),
             )
             z = z.reshape(z.size(0), -1, self.head_v_dim)
         else:
@@ -5708,7 +5745,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state=ssm_state,
             attn_metadata=attn_metadata,
         )
-        if use_dflash2_packed_gdn_verify:
+        use_sm70_mixed_qkv_verify = (
+            mixed_qkv_decode_requested
+            and not use_dflash2_packed_gdn_verify
+            and spec_sequence_masks is not None
+            and ddtree_parent_ids is None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes == 0
+            and attn_metadata.num_spec_decodes > 0
+            and current_platform.is_device_capability(70)
+            and self.num_k_heads // self.tp_size == 4
+            and self.num_v_heads // self.tp_size == 12
+            and self.head_k_dim == self.head_v_dim == 128
+            and ssm_state.dtype == torch.float32
+            and mixed_qkv_spec is not None
+            and mixed_qkv_spec.is_contiguous()
+            and 1 < mixed_qkv_spec.shape[0] <= 16
+        )
+        if use_dflash2_packed_gdn_verify or use_sm70_mixed_qkv_verify:
             query_spec, key_spec, value_spec = None, None, None
         else:
             query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
@@ -5878,6 +5932,36 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     num_spec_decodes=attn_metadata.num_spec_decodes,
                 )
                 last_recurrent_state = ssm_state
+            elif use_sm70_mixed_qkv_verify:
+                assert mixed_qkv_spec is not None
+                assert spec_query_start_loc is not None
+                # Reuse the decode loader with the original fused verifier's
+                # gating, BV32 reduction and FP32 state. Avoid materializing
+                # three contiguous splits and concatenating them again.
+                core_attn_out_spec, last_recurrent_state = (
+                    fused_sigmoid_gating_delta_rule_update_mixed_qkv(
+                        A_log=self.A_log,
+                        a=a_spec,
+                        b=b_spec,
+                        dt_bias=self.dt_bias,
+                        mixed_qkv=mixed_qkv_spec,
+                        num_q_heads=self.num_k_heads // self.tp_size,
+                        num_v_heads=self.num_v_heads // self.tp_size,
+                        head_k_dim=self.head_k_dim,
+                        head_v_dim=self.head_v_dim,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=spec_query_start_loc[
+                            : attn_metadata.num_spec_decodes + 1
+                        ],
+                        ssm_state_indices=spec_state_indices_tensor,
+                        num_accepted_tokens=spec_state_slot_selectors,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
+                _log_runtime_route_once(
+                    "SM70 mixed-QKV fused GDN target-verification route hit."
+                )
             else:
                 assert query_spec is not None
                 assert key_spec is not None

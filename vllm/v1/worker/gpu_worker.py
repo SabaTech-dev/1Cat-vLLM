@@ -46,6 +46,7 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.layers.ple_offload_layer import ple_offload_enabled
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -54,7 +55,10 @@ from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
-from vllm.utils.torch_utils import set_random_seed
+from vllm.utils.torch_utils import (
+    set_high_precision_cuda_matmul_defaults,
+    set_random_seed,
+)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
@@ -130,6 +134,10 @@ class Worker(WorkerBase):
         # configure float32 matmul precision according to vLLM env.
         precision = envs.VLLM_FLOAT32_MATMUL_PRECISION
         torch.set_float32_matmul_precision(precision)
+        # Do this before loading weights or compiling/capturing any model
+        # graphs. Reduced-precision FP16/BF16 reductions are opt-in only;
+        # production defaults must not trade numerical precision for speed.
+        set_high_precision_cuda_matmul_defaults()
 
         from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
 
@@ -159,17 +167,17 @@ class Worker(WorkerBase):
         self._ple_offload_spawn_config: VllmConfig | None = None
         if envs.VLLM_SM70_QWEN38_HYBRID_PLE and not (
             envs.VLLM_SM70_QWEN38_DUAL_COMPILE
-            and envs.VLLM_PLE_CPU_OFFLOAD
+            and ple_offload_enabled(self.vllm_config)
             and envs.VLLM_PLE_DISK_OFFLOAD
         ):
             raise ValueError(
                 "VLLM_SM70_QWEN38_HYBRID_PLE requires dual compilation plus "
                 "PLE CPU and disk offload"
             )
-        if envs.VLLM_PLE_DISK_OFFLOAD and not envs.VLLM_PLE_CPU_OFFLOAD:
+        if envs.VLLM_PLE_DISK_OFFLOAD and not ple_offload_enabled(self.vllm_config):
             raise ValueError("VLLM_PLE_DISK_OFFLOAD requires VLLM_PLE_CPU_OFFLOAD=1")
         self._ple_offload_enabled = self._has_ple_layers()
-        if envs.VLLM_PLE_CPU_OFFLOAD:
+        if ple_offload_enabled(self.vllm_config):
             if self._ple_offload_enabled:
                 self._validate_ple_offload_config()
             elif self.rank == 0 and self.parallel_config.data_parallel_rank == 0:
@@ -184,7 +192,7 @@ class Worker(WorkerBase):
         self._pp_send_work: list[Handle] = []
 
     def _has_ple_layers(self) -> bool:
-        if not envs.VLLM_PLE_CPU_OFFLOAD:
+        if not ple_offload_enabled(getattr(self, "vllm_config", None)):
             return False
         return bool(getattr(self.model_config.hf_text_config, "ple_layer_ids", None))
 
@@ -206,8 +214,10 @@ class Worker(WorkerBase):
                 f"({parallel_config.data_parallel_size_local}/"
                 f"{parallel_config.data_parallel_size} local ranks)"
             )
-        if parallel_config.pipeline_parallel_size != 1:
-            unsupported.append(f"PP={parallel_config.pipeline_parallel_size}")
+        # Pipeline parallelism is fine: the PLE table sits on the first
+        # stage only (check_ple_layers_on_first_pp_rank refuses a layout that
+        # puts PLE layers anywhere else), and ranks without a PleOffloadLayer
+        # do not create a connector.
         if parallel_config.prefill_context_parallel_size != 1:
             unsupported.append(f"PCP={parallel_config.prefill_context_parallel_size}")
         if parallel_config.decode_context_parallel_size != 1:
@@ -350,18 +360,25 @@ class Worker(WorkerBase):
             yield
             return
 
-        conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-        match = re.search(r"max_split_size_mb:(\d+)", conf)
-        original_value = match.group(1) if match else None
-
-        set_allocator_settings(f"max_split_size_mb:{max_split_size_mb}")
+        # Runtime allocator settings reset omitted options such as rounding and
+        # garbage collection. Preserve the complete config, including the newer
+        # alias; PyTorch gives the legacy variable precedence even when empty.
+        conf = os.environ.get(
+            "PYTORCH_CUDA_ALLOC_CONF", os.environ.get("PYTORCH_ALLOC_CONF", "")
+        )
+        scoped_conf, count = re.subn(
+            r"(^|,)\s*max_split_size_mb\s*:\s*\d+",
+            lambda match: f"{match.group(1)}max_split_size_mb:{max_split_size_mb}",
+            conf,
+        )
+        if not count:
+            scoped_conf = f"{conf}," if conf else ""
+            scoped_conf += f"max_split_size_mb:{max_split_size_mb}"
+        set_allocator_settings(scoped_conf)
         try:
             yield
         finally:
-            # PyTorch defaults to SIZE_MAX (no limit).
-            _SIZE_MAX_MB = (2**64 - 1) // (1024 * 1024)
-            restore = original_value if original_value else str(_SIZE_MAX_MB)
-            set_allocator_settings(f"max_split_size_mb:{restore}")
+            set_allocator_settings(conf)
 
     @instrument(span_name="Init device")
     def init_device(self):
@@ -507,11 +524,18 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
-        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            # still need a profile run which compiles the model for
-            # max_num_batched_tokens
+        # Compilation and lazy workspaces have very different lifetimes. Avoid
+        # pinning large split segments behind small persistent allocations on
+        # SM70, then restore the serving allocator before measuring its peak.
+        warmup_allocator = (
+            self._scoped_allocator_max_split(20)
+            if current_platform.is_cuda() and current_platform.is_device_capability(70)
+            else nullcontext()
+        )
+        with warmup_allocator:
             self.model_runner.profile_run()
 
+        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
                 f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB memory for "
@@ -537,7 +561,6 @@ class Worker(WorkerBase):
         # keeps allocated still counts: non-torch is measured against the
         # init snapshot, and torch memory the warm-up left behind beyond the
         # weights is added below as warmup_torch_residual.
-        self.model_runner.profile_run()
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(
@@ -561,6 +584,21 @@ class Worker(WorkerBase):
                 != CUDAGraphMode.NONE
             ):
                 cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+                if self.use_v2_model_runner and current_platform.is_device_capability(
+                    70
+                ):
+                    from vllm.v1.worker.gpu.cudagraph_utils import (
+                        get_sm70_cudagraph_memory_reserve,
+                    )
+
+                    cudagraph_memory_estimate = get_sm70_cudagraph_memory_reserve(
+                        self.vllm_config.compilation_config.cudagraph_mode,
+                        profile_torch_peak - profile_result.before_profile.torch_peak,
+                    )
+                    logger.info(
+                        "SM70 graph memory reserve before KV allocation: %.2f GiB",
+                        cudagraph_memory_estimate / 2**30,
+                    )
 
         # Use the pre-cudagraph torch peak to avoid double-counting.
         profile_result.torch_peak_increase = (
@@ -589,6 +627,7 @@ class Worker(WorkerBase):
 
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
+        self.warmup_torch_memory = warmup_torch_residual
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
         free_gpu_memory = profile_result.after_profile.free_memory
@@ -804,6 +843,7 @@ class Worker(WorkerBase):
 
             non_kv_cache_memory = (
                 self.model_runner.model_memory_usage
+                + self.warmup_torch_memory
                 + self.peak_activation_memory
                 + self.non_torch_memory
                 + cuda_graph_memory_bytes
@@ -828,7 +868,9 @@ class Worker(WorkerBase):
                 f"{format_gib(self.requested_memory)} GiB). "
                 f"Actual usage is {format_gib(self.model_runner.model_memory_usage)} "
                 f"GiB for weight, {format_gib(self.peak_activation_memory)} GiB "
-                f"for peak activation, {format_gib(self.non_torch_memory)} GiB "
+                f"for peak activation, {format_gib(self.warmup_torch_memory)} GiB "
+                f"for persistent warmup allocations, "
+                f"{format_gib(self.non_torch_memory)} GiB "
                 f"for non-torch memory, and {format_gib(cuda_graph_memory_bytes)} "
                 f"GiB for CUDAGraph memory. Replace gpu_memory_utilization "
                 f"config with `--kv-cache-memory="
@@ -890,6 +932,22 @@ class Worker(WorkerBase):
 
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
+
+    def get_sm70_acceleration_report(self) -> dict:
+        """Read local selector decisions without rerunning capability probes."""
+        from vllm.sm70_profiles.acceleration import (
+            loaded_linear_kernels,
+            loaded_sm70_preparations,
+        )
+
+        selections = self.vllm_config.kernel_config.linear_kernel_selections
+        return {
+            "rank": self.rank,
+            "scope": "loaded_layer_selection",
+            "linear_kernel_selections": selections,
+            "prepared_linear_kernels": loaded_linear_kernels(self.model_runner.model),
+            "sm70_preparations": loaded_sm70_preparations(self.model_runner.model),
+        }
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
@@ -1369,6 +1427,9 @@ class Worker(WorkerBase):
         self._is_checkpoint_format = True
 
     def shutdown(self) -> None:
+        from vllm.v1.worker.gpu.shutdown import log_loaded_attention_route_summaries
+
+        log_loaded_attention_route_summaries()
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()

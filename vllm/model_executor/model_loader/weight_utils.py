@@ -5,6 +5,7 @@
 import asyncio
 import concurrent.futures
 import fnmatch
+import functools
 import glob
 import hashlib
 import json
@@ -35,10 +36,20 @@ from vllm.config.load import (
     LoadConfig,
 )
 from vllm.distributed import get_tensor_model_parallel_rank, get_world_group
+from vllm.distributed.parallel_state import get_tp_group, model_parallel_is_initialized
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
+)
+from vllm.model_executor.model_loader.direct_io import (
+    RunSharing,
+    _group_ready,
+    cgroup_available_bytes,
+    direct_io_capability,
+    direct_io_weights,
+    is_decoder_layer_weight,
+    released_mapped_weights,
 )
 from vllm.model_executor.model_loader.ep_weight_filter import (
     should_skip_weight,
@@ -810,7 +821,9 @@ def _get_available_ram_bytes() -> int:
     """Return the available RAM in bytes."""
     import psutil
 
-    return psutil.virtual_memory().available
+    available = psutil.virtual_memory().available
+    group_available = cgroup_available_bytes()
+    return available if group_available is None else min(available, group_available)
 
 
 def _get_fs_type(files: list[str]) -> str:
@@ -938,6 +951,53 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+def _keep_weight(
+    name: str,
+    indexed_weights: set[str] | None,
+    local_expert_ids: set[int] | None,
+    skip_weight: Callable[[str], bool] | None,
+) -> bool:
+    """Decide from the name alone whether a tensor is read at all."""
+    if indexed_weights is not None and name not in indexed_weights:
+        return False
+    if should_skip_weight(name, local_expert_ids):
+        return False
+    return skip_weight is None or not skip_weight(name)
+
+
+def _direct_io_sharing(local_expert_ids: set[int] | None) -> RunSharing | None:
+    """The tensor-parallel group reads the same decoder tensors, so its first
+    rank reads them for all; not under expert parallelism, where each rank
+    keeps other experts."""
+    if local_expert_ids is not None or not model_parallel_is_initialized():
+        return None
+    tp_group = get_tp_group()
+    if tp_group.world_size == 1:
+        return None
+    return RunSharing(tp_group.cpu_group, tp_group.first_rank, tp_group.is_first_rank)
+
+
+def _keep_direct_weight(
+    name: str,
+    *,
+    indexed_weights: set[str] | None,
+    local_expert_ids: set[int] | None,
+    skip_weight: Callable[[str], bool] | None,
+    map_weight: Callable[[str], bool] | None,
+    read_directly: bool,
+) -> bool:
+    """Whether a kept tensor goes through O_DIRECT (*read_directly*) or the
+    memory map: decoder-layer tensors are read directly unless the model
+    wants them mapped; everything else is mapped, so that a pipeline stage
+    reads only the embeddings, heads or MTP layers it actually uses."""
+    if not _keep_weight(name, indexed_weights, local_expert_ids, skip_weight):
+        return False
+    direct = is_decoder_layer_weight(name) and not (
+        map_weight is not None and map_weight(name)
+    )
+    return direct == read_directly
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -945,6 +1005,9 @@ def safetensors_weights_iterator(
     local_expert_ids: set[int] | None = None,
     *,
     indexed_weights_by_file: Mapping[str, set[str]] | None = None,
+    skip_weight: Callable[[str], bool] | None = None,
+    map_weight: Callable[[str], bool] | None = None,
+    auto_direct: bool = True,
     safetensors_prefetch_num_threads: int = DEFAULT_SAFETENSORS_PREFETCH_NUM_THREADS,
     safetensors_prefetch_block_size: int = DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -953,6 +1016,15 @@ def safetensors_weights_iterator(
     When *local_expert_ids* is provided, expert weights not belonging to
     this rank are skipped **before** reading from disk, which drastically
     reduces storage I/O for MoE models under EP.
+
+    When *skip_weight* is provided, every tensor whose name it accepts is
+    skipped the same way. It lets a model that loads only part of a shared
+    checkpoint (e.g. a drafter shipped inside its target's checkpoint) avoid
+    reading the rest.
+
+    With the "direct" strategy only decoder-layer tensors are read with
+    O_DIRECT; the rest and those *map_weight* accepts are yielded
+    memory-mapped after them, and their pages are released once consumed.
     """
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
@@ -982,6 +1054,32 @@ def safetensors_weights_iterator(
         total_bytes / 1024**3,
         avail_bytes / 1024**3,
     )
+
+    if safetensors_load_strategy is None and auto_direct:
+        direct_ok = not fits_in_ram and fs_type not in ("tmpfs", "ramfs")
+        reason: str | None = (
+            "checkpoint fits the available-RAM budget"
+            if fits_in_ram
+            else "checkpoint storage is memory-backed"
+        )
+        if direct_ok:
+            reason = None
+            for path in sorted_files:
+                direct_ok, reason = direct_io_capability(path)
+                if not direct_ok:
+                    break
+        sharing = _direct_io_sharing(local_expert_ids)
+        if sharing is not None and not _group_ready(direct_ok, sharing):
+            direct_ok = False
+            reason = reason or "a tensor-parallel peer does not qualify"
+        if direct_ok:
+            safetensors_load_strategy = "direct"
+            logger.info_once(
+                "Auto direct I/O enabled: checkpoint exceeds the available-RAM "
+                "budget and aligned storage reads are supported."
+            )
+        else:
+            logger.info_once("Auto direct I/O unavailable: %s.", reason)
 
     should_prefetch = safetensors_load_strategy == "prefetch"
     if safetensors_load_strategy is None:
@@ -1050,10 +1148,24 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
-                if indexed_weights is not None and name not in indexed_weights:
-                    continue
-                if not should_skip_weight(name, local_expert_ids):
+                if _keep_weight(name, indexed_weights, local_expert_ids, skip_weight):
                     yield name, param
+        elif safetensors_load_strategy == "direct":
+            keep = functools.partial(
+                _keep_direct_weight,
+                indexed_weights=indexed_weights,
+                local_expert_ids=local_expert_ids,
+                skip_weight=skip_weight,
+                map_weight=map_weight,
+            )
+            yield from direct_io_weights(
+                st_file,
+                functools.partial(keep, read_directly=True),
+                _direct_io_sharing(local_expert_ids),
+            )
+            yield from released_mapped_weights(
+                st_file, functools.partial(keep, read_directly=False)
+            )
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
             # instead we reconstruct the subclasses here before returning
@@ -1069,9 +1181,9 @@ def safetensors_weights_iterator(
             with safe_open(st_file, framework="pt") as f:
                 state_dict = {}
                 for name in f.keys():  # noqa: SIM118
-                    if indexed_weights is not None and name not in indexed_weights:
-                        continue
-                    if should_skip_weight(name, local_expert_ids):
+                    if not _keep_weight(
+                        name, indexed_weights, local_expert_ids, skip_weight
+                    ):
                         continue
                     state_dict[name] = f.get_tensor(name)
 
@@ -1089,9 +1201,9 @@ def safetensors_weights_iterator(
         else:
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
-                    if indexed_weights is not None and name not in indexed_weights:
-                        continue
-                    if should_skip_weight(name, local_expert_ids):
+                    if not _keep_weight(
+                        name, indexed_weights, local_expert_ids, skip_weight
+                    ):
                         continue
                     param = f.get_tensor(name)
                     yield name, param
@@ -1338,7 +1450,9 @@ def multi_thread_pt_weights_iterator(
 def get_gguf_extra_tensor_names(
     gguf_file: str | Path, gguf_to_hf_name_map: dict[str, str]
 ) -> list[str]:
-    reader = gguf.GGUFReader(gguf_file)
+    from vllm.transformers_utils.gguf_tensor_reader import GGUFReader
+
+    reader = GGUFReader(gguf_file)
     expected_gguf_keys = set(gguf_to_hf_name_map.keys())
     exact_gguf_keys = set([tensor.name for tensor in reader.tensors])
     extra_keys = expected_gguf_keys - exact_gguf_keys
@@ -1351,9 +1465,11 @@ def get_gguf_weight_type_map(
     """
     Return GGUF mapped weight's name and its quant type
     """
-    reader = gguf.GGUFReader(gguf_file)
+    from vllm.transformers_utils.gguf_tensor_reader import GGUFReader, quant_type_name
+
+    reader = GGUFReader(gguf_file)
     return {
-        gguf_to_hf_name_map[tensor.name]: tensor.tensor_type.name
+        gguf_to_hf_name_map[tensor.name]: quant_type_name(tensor.tensor_type)
         for tensor in reader.tensors
         if tensor.name in gguf_to_hf_name_map
     }
@@ -1371,7 +1487,9 @@ def gguf_quant_weights_iterator(
     layer with different quant types.
     """
 
-    reader = gguf.GGUFReader(gguf_file)
+    from vllm.transformers_utils.gguf_tensor_reader import GGUFReader
+
+    reader = GGUFReader(gguf_file)
 
     for tensor in reader.tensors:
         if tensor.name in gguf_to_hf_name_map:
@@ -1415,7 +1533,9 @@ def gguf_quant_weights_iterator_multi(
     before yielding any weights data to avoid issues with packed layers
     that have different quant types.
     """
-    readers = [gguf.GGUFReader(f) for f in gguf_files]
+    from vllm.transformers_utils.gguf_tensor_reader import GGUFReader
+
+    readers = [GGUFReader(f) for f in gguf_files]
 
     # First pass: yield all weight types across all shards
     for reader in readers:

@@ -4,9 +4,11 @@
 
 import sys
 import types
+import weakref
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -217,11 +219,14 @@ def test_flash_v100_priority_is_sm70_only(monkeypatch):
         device_capability=DeviceCapability(major=7, minor=5),
     )
 
+    # Turing: FLASH_ATTN via the sm75 FA2 build, then TRITON_ATTN. FlashInfer is
+    # not offered on 7.5 (its paged prefill fails with "invalid argument").
     assert backends[:3] == [
         AttentionBackendEnum.FLASH_ATTN,
-        AttentionBackendEnum.FLASHINFER,
         AttentionBackendEnum.TRITON_ATTN,
+        AttentionBackendEnum.FLEX_ATTENTION,
     ]
+    assert AttentionBackendEnum.FLASHINFER not in backends
     assert AttentionBackendEnum.FLASH_ATTN_V100 not in backends
 
 
@@ -600,6 +605,127 @@ def test_prefill_gather_dense_falls_back_when_workspace_is_out_of_memory(
     assert flash_v100._warned_prefill_gather_oom is True
 
 
+def _assert_growth_releases_previous_workspace(
+    *,
+    cache: dict,
+    grow: "Callable[[], object]",
+) -> None:
+    """Growth must drop the old buffers before allocating the larger ones.
+
+    Holding the previous workspace across the growing allocation makes both
+    resident at once, which is what upstream FlashMLA hit in vLLM #56902: the
+    grown allocation can then fail on the memory its own predecessor owns.
+    """
+    assert len(cache) == 1
+    previous = next(iter(cache.values()))
+    alive = weakref.ref(previous[0])
+    del previous
+
+    observed: dict[str, bool] = {}
+    real_empty = torch.empty
+
+    def probe(*args, **kwargs):
+        observed.setdefault("previous_alive", alive() is not None)
+        return real_empty(*args, **kwargs)
+
+    with mock.patch.object(torch, "empty", probe):
+        grow()
+
+    assert observed["previous_alive"] is False, (
+        "previous workspace was still resident while the grown one was allocated"
+    )
+
+
+def test_prefill_gather_dense_growth_releases_previous_workspace(monkeypatch):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    cache: dict = {}
+    monkeypatch.setattr(flash_v100, "_prefill_gather_dense_workspaces", cache)
+    key_cache = torch.empty((8, 4, 1, 2), dtype=torch.float16)
+
+    assert flash_v100._get_prefill_gather_dense_workspace(key_cache, 2) is not None
+    _assert_growth_releases_previous_workspace(
+        cache=cache,
+        grow=lambda: flash_v100._get_prefill_gather_dense_workspace(key_cache, 6),
+    )
+
+
+def test_prefill_gather_dense_growth_stops_at_block_table_width(monkeypatch):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    cache: dict = {}
+    monkeypatch.setattr(flash_v100, "_prefill_gather_dense_workspaces", cache)
+    key_cache = torch.empty((32, 4, 1, 2), dtype=torch.float16)
+
+    assert (
+        flash_v100._get_prefill_gather_dense_workspace(key_cache, 8, max_blocks=10)
+        is not None
+    )
+    assert next(iter(cache.values()))[0].shape[0] == 8
+
+    # Doubling would reserve 16 pages, but only 10 are ever addressable.
+    assert (
+        flash_v100._get_prefill_gather_dense_workspace(key_cache, 9, max_blocks=10)
+        is not None
+    )
+    assert next(iter(cache.values()))[0].shape[0] == 10
+
+
+def test_fp8_prefill_bridge_growth_releases_previous_workspace(monkeypatch):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    cache: dict = {}
+    monkeypatch.setattr(flash_v100, "_fp8_prefill_bridge_workspaces", cache)
+    monkeypatch.setattr(flash_v100, "_FP8_PREFILL_BRIDGE_PAGE_SIZE", 4)
+    key_cache = torch.empty((8, 4, 1, 2), dtype=torch.uint8)
+
+    assert flash_v100._get_fp8_prefill_bridge_workspace(key_cache, 2) is not None
+    _assert_growth_releases_previous_workspace(
+        cache=cache,
+        grow=lambda: flash_v100._get_fp8_prefill_bridge_workspace(key_cache, 6),
+    )
+
+
+def test_fp8_prefill_bridge_tail_growth_releases_previous_workspace(monkeypatch):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    cache: dict = {}
+    monkeypatch.setattr(flash_v100, "_fp8_prefill_bridge_tail_workspaces", cache)
+    query = torch.empty((1, 8, 2, 4), dtype=torch.float16)
+
+    assert flash_v100._get_fp8_prefill_bridge_tail_workspace(query, 4) is not None
+    _assert_growth_releases_previous_workspace(
+        cache=cache,
+        grow=lambda: flash_v100._get_fp8_prefill_bridge_tail_workspace(query, 12),
+    )
+
+
+def test_workspace_growth_retries_once_after_releasing_cached_blocks(monkeypatch):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    cache: dict = {}
+    monkeypatch.setattr(flash_v100, "_prefill_gather_dense_workspaces", cache)
+    monkeypatch.setattr(flash_v100, "_warned_prefill_gather_oom", False)
+    key_cache = torch.empty((8, 4, 1, 2), dtype=torch.float16)
+
+    attempts = {"count": 0}
+    real_empty = torch.empty
+
+    def fail_first(*args, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise torch.OutOfMemoryError("expected test OOM")
+        return real_empty(*args, **kwargs)
+
+    with mock.patch.object(torch, "empty", fail_first):
+        workspace = flash_v100._get_prefill_gather_dense_workspace(key_cache, 3)
+        warned = flash_v100._warned_prefill_gather_oom
+
+    assert workspace is not None
+    assert attempts["count"] == 2
+    assert warned is False
+
+
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     [
@@ -862,6 +988,7 @@ def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch, v37):
         _vllm_fa2_C=SimpleNamespace(
             sm70_d256_gqa_architecture_fwd=architecture,
             sm70_d256_gqa_v37_fwd=architecture,
+            sm70_d256_gqa_accumulation_bits=lambda: 32,
         )
     )
     monkeypatch.setattr(flash_v100, "torch", SimpleNamespace(ops=fake_ops))
@@ -873,6 +1000,29 @@ def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch, v37):
     monkeypatch.setattr(flash_v100, "_sm70_d256_gqa_architecture_op", None)
 
     assert flash_v100._get_sm70_d256_gqa_architecture_op() is architecture
+
+
+@pytest.mark.parametrize("bits", [None, 16, 32])
+@pytest.mark.parametrize("q8192", [False, True])
+def test_sm70_architecture_rejects_stale_accumulation(monkeypatch, bits, q8192):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0")
+    architecture = object()
+    native = SimpleNamespace(
+        sm70_d256_gqa_architecture_fwd=architecture,
+        sm70_d256_gqa_architecture_q8192_fwd=architecture,
+    )
+    if bits is not None:
+        native.sm70_d256_gqa_accumulation_bits = lambda: bits
+    monkeypatch.setattr(
+        flash_v100, "torch", SimpleNamespace(ops=SimpleNamespace(_vllm_fa2_C=native))
+    )
+    name = "_sm70_d256_gqa_architecture" + ("_q8192" if q8192 else "") + "_op"
+    monkeypatch.setattr(flash_v100, name, None)
+    monkeypatch.setattr(flash_v100, name + "_checked", False)
+    loader = getattr(flash_v100, "_get" + name)
+    assert loader() is (architecture if bits == 32 else None)
 
 
 def test_prefill_dense_splitkv3_workspace_reuses_exact_shape(monkeypatch):
@@ -1813,7 +1963,9 @@ def test_sm70_speculative_cudagraph_shapes_are_tp_independent_and_bounded():
         18,
         20,
     ]
-    assert _sm70_speculative_cudagraph_capture_sizes(256, 5)[-1] == 80
+    assert _sm70_speculative_cudagraph_capture_sizes(256, 5)[-1] == 160
+    for concurrency in (2, 4, 8, 16, 32):
+        assert concurrency * 8 in _sm70_speculative_cudagraph_capture_sizes(32, 8)
 
 
 def test_flash_v100_decode_query_does_not_attach_smallq_metadata(
@@ -3485,3 +3637,145 @@ def test_e4m3_fp32_smallq_forwards_live_lengths_or_falls_back(monkeypatch, mode)
         assert calls[0][0][3] is table
         assert routes == ["prefill_smallq_decode_scalar"]
         assert bool((out == 2).all())
+
+
+@pytest.mark.parametrize("batch", [2, 8, 16])
+@pytest.mark.parametrize("native_revision_six", [False, True])
+def test_e4m3_fp32_request_major_admission_requires_native_revision(
+    monkeypatch, batch, native_revision_six
+):
+    import flash_attn_v100
+
+    from vllm.v1.attention.ops.sm70_e4m3_grouped import (
+        grouped_e4m3_fp32_allowed,
+    )
+
+    monkeypatch.setattr(
+        flash_attn_v100,
+        "flash_attn_grouped_e4m3_fp32_available",
+        lambda min_version=4: native_revision_six and min_version == 6,
+    )
+    query = torch.empty((batch * 8, 6, 256), dtype=torch.float16)
+    output = torch.empty_like(query)
+    cache = torch.empty((batch, 3296, 1, 256), dtype=torch.uint8)
+    table = torch.zeros((batch * 8, 1), dtype=torch.int32)
+    lengths = torch.full((batch * 8,), 2048, dtype=torch.int32)
+    metadata = SimpleNamespace(
+        block_table=table[::8].contiguous(),
+        seq_lens=torch.full((batch,), 2048, dtype=torch.int32),
+        causal=True,
+    )
+    instance = SimpleNamespace(
+        flash_attn_grouped_e4m3_fp32_paged=object(),
+        kv_cache_dtype="fp8_e4m3",
+        use_smallq_decode_xqa=True,
+        _flash_v100_window_size=lambda causal: (-1, -1),
+    )
+    assert (
+        grouped_e4m3_fp32_allowed(
+            instance,
+            query,
+            cache,
+            cache,
+            table,
+            lengths,
+            metadata,
+            out=output,
+            partition_size_hint=None,
+        )
+        is native_revision_six
+    )
+
+
+@pytest.mark.parametrize("kv_heads", [1, 2, 4])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_prefill_architecture_admits_local_gqa_groups(monkeypatch, kv_heads, batch):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0")
+    query = torch.empty(
+        (batch, 8192, 6 * kv_heads, 256), dtype=torch.float16, device="meta"
+    )
+    key = torch.empty(
+        (batch, 262144, kv_heads, 256), dtype=torch.float16, device="meta"
+    )
+    assert mod._should_use_prefill_d256_gqa_architecture(
+        query,
+        key,
+        key,
+        max_seqlen_q=8192,
+        max_seqlen_k=262144,
+        softmax_scale=0.0625,
+        architecture_op=object(),
+    )
+
+
+@pytest.mark.parametrize("kv_heads", [1, 2, 4])
+def test_gqa_group_dispatch_preserves_head_and_batch_mapping(kv_heads):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    q = torch.arange(2 * 7 * 6 * kv_heads * 4).reshape(2, 7, 6 * kv_heads, 4).float()
+    k = torch.arange(2 * 9 * kv_heads * 4).reshape(2, 9, kv_heads, 4).float()
+    v = k + 3
+    out = torch.empty_like(q)
+    calls = []
+
+    def operator(query, key, value, output, scale, causal):
+        assert query.is_contiguous() and key.is_contiguous() and value.is_contiguous()
+        assert query.shape[2] == 6 and key.shape[2] == 1
+        assert scale == 0.0625 and causal
+        output.copy_(
+            query + key[:, :7].expand_as(query) + value[:, :7].expand_as(query)
+        )
+        calls.append(1)
+        return output
+
+    mod._run_sm70_gqa_groups(operator, q, k, v, out, 0.0625, True)
+    expected = (
+        q + k[:, :7].repeat_interleave(6, dim=2) + v[:, :7].repeat_interleave(6, dim=2)
+    )
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    assert len(calls) == 2 * kv_heads
+
+
+@pytest.mark.parametrize("kv_heads", [1, 2, 4])
+@pytest.mark.parametrize("batch", [2, 4, 8, 16, 32])
+def test_e4m3_xqa_policy_accepts_multiple_kv_heads(kv_heads, batch):
+    from vllm.v1.attention.backends import flash_attn_v100 as mod
+
+    q = torch.empty((batch, 6 * kv_heads, 256), dtype=torch.float16)
+    assert mod._e4m3_batch_xqa_allowed(q)
+    k = torch.empty((1, 800, kv_heads, 256), dtype=torch.uint8)
+    assert mod._g6_aligned_page_partition_size_hint(q[:1], k, k, "fp8_e4m3") == 64
+
+
+@pytest.mark.parametrize(
+    ("query_len", "kv_len"), [(8001, 8032), (8064, 8128), (8160, 8160)]
+)
+def test_sm70_79t_short_first_chunk_preserves_causal_visibility(query_len, kv_len):
+    import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
+
+    query = torch.zeros((1, query_len, 6, 1), dtype=torch.float32)
+    key = torch.zeros((1, kv_len, 1, 1), dtype=torch.float32)
+    value = torch.arange(kv_len, dtype=torch.float32).view(1, kv_len, 1, 1)
+    out = torch.empty_like(query)
+
+    def uniform_causal_attention(q, k, v, output, scale, causal):
+        assert q.shape[1] == k.shape[1] == 8192
+        assert causal
+        # For zero Q/K, exact causal attention is the prefix mean of V.
+        count = torch.arange(1, 8193).view(1, 8192, 1, 1)
+        output.copy_((v.cumsum(dim=1) / count).expand_as(output))
+        return output
+
+    flash_v100._run_sm70_d256_gqa_79t_q8192_dispatch(
+        query,
+        key,
+        value,
+        out,
+        softmax_scale=0.0625,
+        architecture_q8192_op=uniform_causal_attention,
+    )
+    last_visible = kv_len - query_len + torch.arange(query_len)
+    expected = (last_visible / 2).view(1, query_len, 1, 1).expand_as(out)
+    torch.testing.assert_close(out, expected)

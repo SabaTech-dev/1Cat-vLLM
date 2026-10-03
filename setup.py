@@ -15,8 +15,10 @@ from pathlib import Path
 from shutil import which
 
 import torch
+from packaging.tags import sys_tags
 from packaging.version import Version, parse
 from setuptools import Extension, find_packages, setup
+from setuptools.command.bdist_wheel import bdist_wheel
 from setuptools.command.build_ext import build_ext
 from setuptools_rust import Binding, RustExtension
 from setuptools_rust.build import build_rust
@@ -42,22 +44,33 @@ FLASH_QLA_SM70_ROOT = (
     ROOT_DIR / "flash_qla" / "ops" / "gated_delta_rule" / "chunk" / "sm70"
 )
 ONECAT_TORCH_CU128_URLS = {
-    "torch==2.10.0": (
-        "torch @ https://download.pytorch.org/whl/cu128/"
-        "torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl"
-    ),
-    "torchaudio==2.10.0": (
-        "torchaudio @ https://download.pytorch.org/whl/cu128/"
-        "torchaudio-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl"
-    ),
-    "torchvision==0.25.0": (
-        "torchvision @ https://download.pytorch.org/whl/cu128/"
-        "torchvision-0.25.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl"
-    ),
+    "torch==2.10.0": ("torch", "2.10.0"),
+    "torchaudio==2.10.0": ("torchaudio", "2.10.0"),
+    "torchvision==0.25.0": ("torchvision", "0.25.0"),
 }
+
+
+def _onecat_torch_cu128_urls() -> dict[str, str]:
+    platform = sysconfig.get_platform()
+    if platform not in {"linux-x86_64", "linux-aarch64"}:
+        raise RuntimeError(
+            f"No pinned CUDA 12.8 PyTorch wheels for platform {platform}"
+        )
+    tag = next(sys_tags())
+    wheel_platform = "manylinux_2_28_" + platform.removeprefix("linux-")
+    return {
+        requirement: (
+            f"{name} @ https://download.pytorch.org/whl/cu128/"
+            f"{name}-{version}%2Bcu128-{tag.interpreter}-{tag.abi}-{wheel_platform}.whl"
+        )
+        for requirement, (name, version) in ONECAT_TORCH_CU128_URLS.items()
+    }
+
 
 # cannot import envs directly because it depends on vllm,
 #  which is not installed yet
+# Preload its dependency without importing vllm's runtime initialization.
+load_module_from_path("vllm.envs_metadata", ROOT_DIR / "vllm" / "envs_metadata.py")
 envs = load_module_from_path("envs", os.path.join(ROOT_DIR, "vllm", "envs.py"))
 
 VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
@@ -184,7 +197,7 @@ def bundle_flash_attn_v100(build_lib: str) -> None:
 
     env = os.environ.copy()
     env["TORCH_CUDA_ARCH_LIST"] = os.environ.get(
-        "FLASH_ATTN_V100_CUDA_ARCH_LIST", "7.0"
+        "FLASH_ATTN_V100_CUDA_ARCH_LIST", _volta_cuda_arch_list() or "7.0"
     )
     subprocess.check_call(
         [sys.executable, "setup.py", "build_ext", "--inplace"],
@@ -235,7 +248,7 @@ def bundle_precompiled_flash_attn_v100(build_lib: str) -> None:
 
 def bundle_flash_qla_sm70(build_lib: str, build_temp: str) -> None:
     """Precompile the SM70 GDN extension so runtime never requires NVCC."""
-    if not _cuda_arch_contains(7, 0):
+    if not _volta_cuda_arch_list():
         return
 
     src = FLASH_QLA_SM70_ROOT / "csrc" / "gdn_forward.cu"
@@ -247,7 +260,7 @@ def bundle_flash_qla_sm70(build_lib: str, build_temp: str) -> None:
     extension_build_dir = Path(build_temp) / "flash_qla_sm70_gdn_strided"
     extension_build_dir.mkdir(parents=True, exist_ok=True)
     previous_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
-    os.environ["TORCH_CUDA_ARCH_LIST"] = "7.0"
+    os.environ["TORCH_CUDA_ARCH_LIST"] = _volta_cuda_arch_list()
     try:
         extension = load_torch_extension(
             name="flash_qla_sm70_gdn_strided",
@@ -255,7 +268,7 @@ def bundle_flash_qla_sm70(build_lib: str, build_temp: str) -> None:
             build_directory=str(extension_build_dir),
             extra_cuda_cflags=[
                 "-O3",
-                "-gencode=arch=compute_70,code=sm_70",
+                *torch.utils.cpp_extension._get_cuda_arch_flags(),
             ],
             extra_cflags=["-O3"],
             with_cuda=True,
@@ -496,8 +509,12 @@ class cmake_build_ext(build_ext):
             bundle_tcmalloc(self.build_lib)
 
         if _is_cuda():
-            bundle_flash_attn_v100(self.build_lib)
-            bundle_flash_qla_sm70(self.build_lib, self.build_temp)
+            # In-place imports resolve the source packages, not build/lib.
+            # Bundle companion kernels beside them just like the native _C
+            # extensions; wheel builds still stage everything in build_lib.
+            bundle_dir = str(ROOT_DIR) if self.inplace else self.build_lib
+            bundle_flash_attn_v100(bundle_dir)
+            bundle_flash_qla_sm70(bundle_dir, self.build_temp)
 
         # copy vllm/vllm_flash_attn/**/*.py from self.build_lib to current
         # directory so that they can be included in the editable build
@@ -542,6 +559,33 @@ class cmake_build_ext(build_ext):
                     "vllm/third_party/deep_gemm",
                     dirs_exist_ok=True,
                 )
+
+
+class vllm_bdist_wheel(bdist_wheel):
+    """Use interpreter-specific tags when native libraries require the full ABI."""
+
+    def finalize_options(self) -> None:
+        super().finalize_options()
+        full_api_extensions = any(
+            not extension.py_limited_api
+            for extension in self.distribution.ext_modules or []
+        )
+        # Precompiled wheels supply native libraries through package_data, even
+        # when TORCH_CUDA_ARCH_LIST does not declare their CMake targets.
+        cpython_package_data = any(
+            re.search(r"\.cpython-\d+[^/]*\.so$", filename)
+            for filenames in (self.distribution.package_data or {}).values()
+            for filename in filenames
+        )
+        if full_api_extensions or cpython_package_data:
+            self.root_is_pure = False
+            if self.py_limited_api:
+                logger.warning(
+                    "Ignoring --py-limited-api=%s: wheel contains "
+                    "CPython-specific native extensions",
+                    self.py_limited_api,
+                )
+                self.py_limited_api = None
 
 
 class precompiled_build_ext(build_ext):
@@ -855,11 +899,13 @@ class precompiled_wheel_utils:
                         {
                             "vllm/_C.abi3.so",
                             "vllm/_C_stable_libtorch.abi3.so",
+                            "vllm/_C_gguf.abi3.so",
                             "vllm/_moe_C.abi3.so",
                             "vllm/_flashmla_C.abi3.so",
                             "vllm/_flashmla_extension_C.abi3.so",
                             "vllm/_sparse_flashmla_C.abi3.so",
                             "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
+                            "vllm/vllm_flash_attn/_vllm_fa2_C_sm75.abi3.so",
                             "vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so",
                             "vllm/cumem_allocator.abi3.so",
                             "vllm/spinloop.abi3.so",
@@ -894,8 +940,9 @@ class precompiled_wheel_utils:
                 flash_qla_sm70_ext_regex = re.compile(
                     r"flash_qla/ops/gated_delta_rule/chunk/sm70/[^/]+\.so"
                 )
-                sm70_sampler_ext_regex = re.compile(
-                    r"vllm/_sm70_(?:sampler|exact_reduce)_C(?:\.[^/]+)?\.so$"
+                sm70_ext_regex = re.compile(
+                    r"vllm/_sm70_(?:sampler|exact_reduce|sparse_attention)_C"
+                    r"(?:\.[^/]+)?\.so$"
                 )
                 h3_ext_regex = re.compile(
                     r"vllm/_h3_(?:w8a16|flashinfer|flashattn)_C(?:\.[^/]+)?\.so$"
@@ -919,7 +966,7 @@ class precompiled_wheel_utils:
                         or deep_gemm_regex.match(member.filename)
                         or flash_attn_v100_ext_regex.match(member.filename)
                         or flash_qla_sm70_ext_regex.match(member.filename)
-                        or sm70_sampler_ext_regex.match(member.filename)
+                        or sm70_ext_regex.match(member.filename)
                         or h3_ext_regex.match(member.filename)
                     ):
                         file_members.append(member)
@@ -1135,6 +1182,22 @@ def _cuda_arch_contains(major: int, minor: int = 0) -> bool:
     return arches is not None and (major, minor) in arches
 
 
+def _volta_cuda_arch_list() -> str:
+    """Keep the requested Volta targets, including explicit PTX, for bundles."""
+    aliases = {"70": "7.0", "7.0": "7.0", "72": "7.2", "7.2": "7.2"}
+    arches = []
+    for raw in re.split(r"[;,\s]+", os.environ.get("TORCH_CUDA_ARCH_LIST", "")):
+        lowered = raw.strip().lower()
+        arch = lowered.removesuffix("+ptx")
+        arch = arch.removeprefix("sm_").removeprefix("compute_")
+        if arch not in aliases:
+            continue
+        target = aliases[arch] + ("+PTX" if lowered.endswith("+ptx") else "")
+        if target not in arches:
+            arches.append(target)
+    return ";".join(arches)
+
+
 def get_vllm_version() -> str:
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
@@ -1203,10 +1266,21 @@ def get_requirements() -> list[str]:
     elif _is_cuda():
         requirements = _read_requirements("cuda.txt")
         cuda_major, cuda_minor = torch.version.cuda.split(".")
+        # An SM70 wheel is a CUDA 12.8 release artifact.  Keep its runtime
+        # dependency on the matching PyTorch wheel in the wheel metadata so a
+        # user installing the wheel does not need to know about this build
+        # detail or export a local-environment override.  The explicit env
+        # switch remains for reproducible packaging jobs that pin the same
+        # dependency while using a non-SM70 target.
+        pin_torch_cu128 = bool(int(os.getenv("ONECAT_VLLM_PIN_TORCH_CU128", "0"))) or (
+            (_cuda_arch_contains(7, 0) or _cuda_arch_contains(7, 2))
+            and torch.version.cuda == "12.8"
+        )
+        torch_cu128_urls = _onecat_torch_cu128_urls() if pin_torch_cu128 else {}
         modified_requirements = []
         for req in requirements:
-            if bool(int(os.getenv("ONECAT_VLLM_PIN_TORCH_CU128", "0"))):
-                req = ONECAT_TORCH_CU128_URLS.get(req.split("#", 1)[0].strip(), req)
+            if pin_torch_cu128:
+                req = torch_cu128_urls.get(req.split("#", 1)[0].strip(), req)
             if "vllm-flash-attn" in req and cuda_major != "12":
                 # vllm-flash-attn is built only for CUDA 12.x.
                 # Skip for other versions.
@@ -1246,7 +1320,7 @@ if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
-    if _cuda_arch_contains(7, 0):
+    if _cuda_arch_contains(7, 0) or _cuda_arch_contains(7, 2):
         ext_modules.append(CMakeExtension(name="vllm._sm70_sampler_C"))
         # These extensions use pybind11/libtorch_python and therefore require
         # the interpreter-specific CPython ABI suffix emitted by CMake.
@@ -1265,9 +1339,15 @@ if _is_cuda():
         ext_modules.append(
             CMakeExtension(name="vllm._sm70_sparse_attention_C", py_limited_api=False)
         )
-    build_sm70_fa2 = _cuda_arch_contains(7, 0) and not _cuda_arch_at_least(8, 0)
+    build_sm70_fa2 = (
+        _cuda_arch_contains(7, 0) or _cuda_arch_contains(7, 2)
+    ) and not _cuda_arch_at_least(8, 0)
     if _cuda_arch_at_least(8, 0) or build_sm70_fa2:
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+    if _cuda_arch_contains(7, 5):
+        # Turing FA2 from a pinned fork, next to the regular library
+        # (cmake/external_projects/vllm_flash_attn_sm75.cmake).
+        ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C_sm75"))
     if _cuda_arch_at_least(8, 0):
         if _cuda_arch_at_least(9, 0) and (
             USE_PRECOMPILED_EXTENSIONS
@@ -1325,6 +1405,8 @@ if _build_custom_ops():
     ext_modules.append(CMakeExtension(name="vllm._C"))
     if _is_cuda() or _is_hip():
         ext_modules.append(CMakeExtension(name="vllm._C_stable_libtorch"))
+    if _is_cuda():
+        ext_modules.append(CMakeExtension(name="vllm._C_gguf"))
 
 package_data = {
     "flash_qla": [
@@ -1348,6 +1430,7 @@ package_data = {
         "third_party/deep_gemm/include/**/*.cuh",
         "third_party/deep_gemm/include/**/*.h",
         "third_party/deep_gemm/include/**/*.hpp",
+        "sm70_profiles/*.json",
     ],
 }
 
@@ -1371,6 +1454,13 @@ if PRECOMPILED_RUST_FRONTEND_PATH.exists():
     if "vllm-rs" not in vllm_files:
         vllm_files.append("vllm-rs")
 
+# A focused CMake source build may prepare the new GGUF extension while the
+# unchanged base operators come from a precompiled wheel. Ship that normally
+# installed module in the final wheel, rather than a task-cache sidecar.
+if USE_PRECOMPILED_EXTENSIONS and (ROOT_DIR / "vllm/_C_gguf.abi3.so").is_file():
+    package_data.setdefault("vllm", []).append("_C_gguf.abi3.so")
+package_data.setdefault("vllm", []).append("third_party/gguf_native/*")
+
 if _no_device():
     ext_modules = []
 
@@ -1384,6 +1474,7 @@ else:
     }
 if USE_PRECOMPILED_RUST_FRONTEND or PRECOMPILED_RUST_FRONTEND_PATH.exists():
     cmdclass["build_rust"] = precompiled_build_rust
+cmdclass["bdist_wheel"] = vllm_bdist_wheel
 
 # Rust frontend binary, built via setuptools-rust and installed into the
 # package directory alongside the Python modules.
@@ -1404,6 +1495,10 @@ setup(
     # static metadata should rather go in pyproject.toml
     version=get_vllm_version(),
     packages=(find_packages(include=["vllm*", "flash_qla*"]) + ["flash_attn_v100"]),
+    scripts=[
+        "scripts/serve_qwen38_27b_nvfp4_v100.sh",
+        "scripts/serve_flash_next_nvfp4_v100.sh",
+    ],
     package_dir={
         "flash_attn_v100": str(FLASH_ATTN_V100_PACKAGE),
     },

@@ -269,7 +269,7 @@ class SpecDecodeBaseProposer:
         self.parallel_drafting_hidden_state_tensor: torch.Tensor | None = None
         if self.parallel_drafting:
             self._init_parallel_drafting_params()
-        self.use_local_argmax_reduction: bool = (
+        self.use_local_argmax_reduction: bool = bool(
             self.speculative_config.use_local_argmax_reduction
         )
 
@@ -2099,7 +2099,9 @@ class SpecDecodeBaseProposer:
         Subclasses may override to apply additional config changes.
         """
         spec_cfg = self.speculative_config
-        base = self.vllm_config
+        # Every replace reruns config validation. Set the scope before changing
+        # draft KV/backend so strict target checks never inspect draft settings.
+        base = replace(self.vllm_config, is_speculative_draft=True)
 
         if spec_cfg.moe_backend is not None:
             base = replace(

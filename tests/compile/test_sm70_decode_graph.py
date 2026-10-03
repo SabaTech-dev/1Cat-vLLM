@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.utils import set_lazy_env
 from vllm.compilation.sm70_decode_graph import (
     is_sm70_decode_graph_compiling,
     sm70_decode_graph_compilation,
@@ -14,9 +15,12 @@ from vllm.compilation.sm70_decode_graph import (
 )
 from vllm.config.parallel import ParallelConfig
 from vllm.config.vllm import (
+    VllmConfig,
+    _apply_qwen4exp_ple_cascade_defaults,
+    _apply_sm70_qwen38_decode_defaults,
     _apply_sm70_qwen38_hybrid_ple_defaults,
-    _apply_sm70_qwen38_nomtp_defaults,
-    _is_sm70_qwen38_nomtp_dual_compile_contract,
+    _is_sm70_qwen38_decode_compile_contract,
+    _qwen4exp_ple_cascade_requested,
 )
 
 
@@ -77,16 +81,12 @@ def test_qwen38_nomtp_dual_compile_contract() -> None:
         pipeline_parallel_size=1,
     )
 
-    assert _is_sm70_qwen38_nomtp_dual_compile_contract(
-        model_config, None, parallel_config
-    )
-    assert not _is_sm70_qwen38_nomtp_dual_compile_contract(
+    assert _is_sm70_qwen38_decode_compile_contract(model_config, None, parallel_config)
+    assert _is_sm70_qwen38_decode_compile_contract(
         model_config, SimpleNamespace(method="mtp"), parallel_config
     )
     parallel_config.tensor_parallel_size = 2
-    assert not _is_sm70_qwen38_nomtp_dual_compile_contract(
-        model_config, None, parallel_config
-    )
+    assert _is_sm70_qwen38_decode_compile_contract(model_config, None, parallel_config)
 
 
 def test_qwen38_nomtp_dual_compile_contract_accepts_awq_lm_only_wrapper() -> None:
@@ -100,17 +100,15 @@ def test_qwen38_nomtp_dual_compile_contract_accepts_awq_lm_only_wrapper() -> Non
         pipeline_parallel_size=1,
     )
 
-    assert _is_sm70_qwen38_nomtp_dual_compile_contract(
-        model_config, None, parallel_config
-    )
+    assert _is_sm70_qwen38_decode_compile_contract(model_config, None, parallel_config)
 
     model_config.multimodal_config.language_model_only = False
-    assert not _is_sm70_qwen38_nomtp_dual_compile_contract(
+    assert not _is_sm70_qwen38_decode_compile_contract(
         model_config, None, parallel_config
     )
 
     model_config.multimodal_config = None
-    assert not _is_sm70_qwen38_nomtp_dual_compile_contract(
+    assert not _is_sm70_qwen38_decode_compile_contract(
         model_config, None, parallel_config
     )
 
@@ -143,13 +141,21 @@ def test_qwen38_nomtp_defaults_preserve_overrides(monkeypatch):
     cfg = _nomtp_default_config()
     disabled = "VLLM_SM70_QWEN38_FP16_GEMV"
     os.environ[disabled] = "0"
-    applied = _apply_sm70_qwen38_nomtp_defaults(cfg, is_sm70=True)
+    applied = _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True)
     assert disabled not in applied and os.environ[disabled] == "0"
     assert len(applied) == 4
     assert os.environ["VLLM_SM70_QWEN38_FUSED_HC_FP16"] == "1"
-    assert _apply_sm70_qwen38_nomtp_defaults(cfg, is_sm70=True) == ()
+    assert "VLLM_SM70_RMSNORM_GATED_EXACT" not in os.environ
+    assert _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True) == ()
     assert "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8" not in os.environ
     assert "VLLM_SM70_NVFP4_QPN2" not in os.environ
+
+
+def test_qwen38_exact_gated_norm_preserves_explicit_override(monkeypatch):
+    monkeypatch.setattr(os, "environ", {"VLLM_SM70_RMSNORM_GATED_EXACT": "0"})
+    applied = _apply_sm70_qwen38_decode_defaults(_nomtp_default_config(), is_sm70=True)
+    assert "VLLM_SM70_RMSNORM_GATED_EXACT" not in applied
+    assert os.environ["VLLM_SM70_RMSNORM_GATED_EXACT"] == "0"
 
 
 @pytest.mark.parametrize(
@@ -158,17 +164,6 @@ def test_qwen38_nomtp_defaults_preserve_overrides(monkeypatch):
         "device",
         "model",
         "dtype",
-        "quantization",
-        "mtp",
-        "tp",
-        "pp",
-        "ep",
-        "dbo",
-        "dp",
-        "nodes",
-        "kv",
-        "ssm",
-        "lora",
         "multimodal",
     ],
 )
@@ -176,37 +171,56 @@ def test_qwen38_nomtp_defaults_reject_unqualified_contract(monkeypatch, mismatch
     monkeypatch.setattr(os, "environ", {})
     cfg = _nomtp_default_config()
     if mismatch == "model":
-        cfg.model_config.hf_text_config.hidden_size = 5120
+        cfg.model_config.architectures = ("LlamaForCausalLM",)
     elif mismatch == "dtype":
         cfg.model_config.dtype = torch.bfloat16
-    elif mismatch == "quantization":
-        cfg.model_config.quantization = "awq"
-    elif mismatch == "mtp":
-        cfg.speculative_config = SimpleNamespace(method="mtp")
-    elif mismatch in ("tp", "pp", "dp", "nodes"):
-        field = {
-            "tp": "tensor_parallel_size",
-            "pp": "pipeline_parallel_size",
-            "dp": "data_parallel_size",
-            "nodes": "nnodes_within_dp",
-        }[mismatch]
-        setattr(cfg.parallel_config, field, 2)
-    elif mismatch in ("ep", "dbo"):
-        setattr(
-            cfg.parallel_config,
-            "enable_expert_parallel" if mismatch == "ep" else "enable_dbo",
-            True,
-        )
-    elif mismatch == "kv":
-        cfg.cache_config.cache_dtype = "fp8_e4m3"
-    elif mismatch == "ssm":
-        cfg.cache_config.mamba_ssm_cache_dtype = "float16"
-    elif mismatch == "lora":
-        cfg.lora_config = SimpleNamespace()
     elif mismatch == "multimodal":
         cfg.model_config.multimodal_config.language_model_only = False
-    assert _apply_sm70_qwen38_nomtp_defaults(cfg, is_sm70=mismatch != "device") == ()
+    assert _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=mismatch != "device") == ()
     assert not os.environ
+
+
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        ("model_config.quantization", None),
+        ("model_config.quantization", "awq"),
+        ("model_config.hf_text_config.hidden_size", 5120),
+        ("model_config.hf_text_config.num_hidden_layers", 32),
+        ("model_config.hf_text_config.num_experts", 256),
+        ("model_config.hf_text_config.num_attention_heads", 32),
+        ("model_config.hf_text_config.indexer_budget", 4096),
+        ("parallel_config.tensor_parallel_size", 2),
+        ("parallel_config.tensor_parallel_size", 8),
+        ("parallel_config.pipeline_parallel_size", 2),
+        ("parallel_config.data_parallel_size", 2),
+        ("parallel_config.nnodes_within_dp", 2),
+        ("parallel_config.enable_expert_parallel", True),
+        ("parallel_config.enable_dbo", True),
+        ("cache_config.cache_dtype", "fp8_e4m3"),
+        ("cache_config.mamba_ssm_cache_dtype", "float16"),
+        ("lora_config", SimpleNamespace()),
+    ],
+)
+def test_projection_defaults_do_not_depend_on_unrelated_model_policy(
+    monkeypatch, path, value
+):
+    monkeypatch.setattr(os, "environ", {})
+    cfg = _nomtp_default_config()
+    obj = cfg
+    *parents, field = path.split(".")
+    for parent in parents:
+        obj = getattr(obj, parent)
+    setattr(obj, field, value)
+    _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True)
+    for name in (
+        "VLLM_SM70_QWEN38_FP16_GEMV",
+        "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16",
+        "VLLM_SM70_QWEN38_FUSED_HC_FP16",
+    ):
+        assert os.environ[name] == "1"
+    if path in ("parallel_config.enable_expert_parallel", "parallel_config.enable_dbo"):
+        assert "VLLM_SM70_MOE_ADD_ALLREDUCE" not in os.environ
 
 
 def test_parallel_config_initializes_ple_ipc_after_late_auto_enable(
@@ -217,7 +231,7 @@ def test_parallel_config_initializes_ple_ipc_after_late_auto_enable(
         "VLLM_PLE_CPU_OFFLOAD",
         "VLLM_PLE_DISK_OFFLOAD",
     ):
-        monkeypatch.delenv(env_name, raising=False)
+        set_lazy_env(monkeypatch, env_name, None)
     parallel_config = ParallelConfig()
     assert parallel_config._ple_offload_ipc_path == ""
 
@@ -235,9 +249,9 @@ def test_parallel_config_initializes_ple_ipc_after_late_auto_enable(
 def test_qwen38_hybrid_ple_decode_uses_local_module(monkeypatch) -> None:
     from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
 
-    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
-    monkeypatch.setenv("VLLM_SM70_QWEN38_HYBRID_PLE", "1")
-    monkeypatch.setenv("VLLM_SM70_QWEN38_DUAL_COMPILE", "1")
+    set_lazy_env(monkeypatch, "VLLM_PLE_CPU_OFFLOAD", "1")
+    set_lazy_env(monkeypatch, "VLLM_SM70_QWEN38_HYBRID_PLE", "1")
+    set_lazy_env(monkeypatch, "VLLM_SM70_QWEN38_DUAL_COMPILE", "1")
 
     class ToyPle(PleOffloadLayer):
         def __init__(self) -> None:
@@ -265,7 +279,7 @@ def test_qwen38_hybrid_ple_decode_uses_local_module(monkeypatch) -> None:
 def test_qwen38_hybrid_ple_skips_decode_offload_request(monkeypatch) -> None:
     from vllm.v1.ple_offload.connector import PleOffloadConnector
 
-    monkeypatch.setenv("VLLM_SM70_QWEN38_HYBRID_PLE", "1")
+    set_lazy_env(monkeypatch, "VLLM_SM70_QWEN38_HYBRID_PLE", "1")
     launches: list[tuple[int, int]] = []
     connector = SimpleNamespace(
         _launch=lambda num_reqs, num_tokens: launches.append((num_reqs, num_tokens))
@@ -279,3 +293,139 @@ def test_qwen38_hybrid_ple_skips_decode_offload_request(monkeypatch) -> None:
     )
 
     assert launches == [(1, 8192)]
+
+
+def test_qwen4exp_ple_cascade_starts_the_offload_worker(monkeypatch) -> None:
+    for name in (
+        "VLLM_PLE_CPU_OFFLOAD",
+        "VLLM_PLE_DISK_OFFLOAD",
+        "VLLM_SM70_QWEN38_HYBRID_PLE",
+    ):
+        set_lazy_env(monkeypatch, name, None)
+    # The isolated worker constructs a model-less engine. It must remain usable
+    # without inheriting admission or changing the process environment.
+    before = dict(os.environ)
+    cfg = VllmConfig()
+    assert not _qwen4exp_ple_cascade_requested(cfg)
+    assert cfg.kernel_config.ple_disk_cascade_reason == "no PLE layers"
+    assert dict(os.environ) == before
+
+    parallel_config = ParallelConfig()
+    assert parallel_config._ple_offload_ipc_path == ""
+    _apply_qwen4exp_ple_cascade_defaults(parallel_config)
+    assert dict(os.environ) == before
+    assert parallel_config._ple_offload_ipc_path.startswith("ipc://")
+
+
+@pytest.mark.parametrize(
+    "method,width,admitted",
+    [
+        ("mtp", 4, True),
+        ("mtp", 3, True),
+        ("mtp", 8, True),
+        ("eagle", 4, True),
+        ("dflash", 4, True),
+    ],
+)
+def test_qwen38_shared_defaults_match_operator_admission(
+    monkeypatch, method, width, admitted
+):
+    from vllm.models.qwen4_exp.nvidia.sm70_fp16_gemv import _exact_runtime_contract
+
+    monkeypatch.setattr(os, "environ", {})
+    cfg = _nomtp_default_config()
+    cfg.speculative_config = SimpleNamespace(
+        method=method, num_speculative_tokens=width
+    )
+    assert _exact_runtime_contract(cfg) == admitted
+    applied = _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True)
+    assert bool(applied) == admitted
+    if admitted:
+        assert len(applied) == (6 if method == "mtp" else 5)
+        assert os.environ["VLLM_SM70_QWEN38_FP16_GEMV"] == "1"
+        assert os.environ["VLLM_SM70_QWEN38_FUSED_HC_FP16"] == "1"
+        assert ("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS" in os.environ) == (
+            method == "mtp"
+        )
+
+
+@pytest.mark.parametrize("tokens", [1, 5])
+def test_hybrid_ple_admits_target_decode_widths(monkeypatch, tokens):
+    from vllm.v1.ple_offload.connector import PleOffloadConnector
+
+    monkeypatch.setenv("VLLM_SM70_QWEN38_HYBRID_PLE", "1")
+    launches = []
+    connector = SimpleNamespace(_launch=lambda *args: launches.append(args))
+    PleOffloadConnector.prepare_forward(connector, 1, tokens, False, True)
+    assert launches == []
+    PleOffloadConnector.prepare_forward(connector, 1, tokens, False, False)
+    assert launches == [(1, tokens)]
+
+
+@pytest.mark.parametrize("decode_tokens", [1, 5])
+@pytest.mark.parametrize(
+    "compile_graph,capability,extra_warmup",
+    [
+        (False, (7, 0), False),
+        (True, (7, 0), True),
+        (True, (7, 5), True),
+        (True, (8, 0), False),
+    ],
+)
+def test_shared_capture_context_reaches_target_and_draft(
+    monkeypatch, decode_tokens, compile_graph, capability, extra_warmup
+):
+    from contextlib import nullcontext
+
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.worker.gpu import cudagraph_utils as cg
+
+    monkeypatch.setenv(
+        "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", str(int(compile_graph))
+    )
+    queried_devices = []
+
+    def get_capability(device_id):
+        queried_devices.append(device_id)
+        return DeviceCapability(*capability)
+
+    monkeypatch.setattr(cg.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(cg.current_platform, "get_device_capability", get_capability)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 1)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(cg, "graph_capture", lambda **kwargs: nullcontext())
+    monkeypatch.setattr(cg, "is_global_first_rank", lambda: False)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", object)
+    monkeypatch.setattr(torch.cuda, "graph", lambda *args: nullcontext())
+    monkeypatch.setattr(
+        cg,
+        "get_offloader",
+        lambda: SimpleNamespace(
+            sync_prev_onload=lambda: None, join_after_forward=lambda: None
+        ),
+    )
+    manager = object.__new__(cg.CudaGraphManager)
+    manager.device = torch.device("cpu")
+    manager.pool = None
+    manager.graphs = {}
+    manager._capture_descs = {
+        mode: [
+            cg.BatchExecutionDescriptor(
+                cg_mode=mode, num_tokens=decode_tokens, num_reqs=1
+            )
+        ]
+        for mode in (CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL)
+    }
+    phases = []
+
+    def create_forward(desc):
+        def forward(mode):
+            phases.append(is_sm70_decode_graph_compiling())
+
+        return forward, (None, None)
+
+    manager.capture(create_forward)
+    assert phases == [False, False] + [True] * (3 if extra_warmup else 2)
+    assert queried_devices == ([1] if compile_graph else [])
+    assert not is_sm70_decode_graph_compiling()

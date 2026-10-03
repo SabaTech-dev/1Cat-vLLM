@@ -200,7 +200,9 @@ class FlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability >= DeviceCapability(8, 0)
+        # SM75 enablement: Turing runs the fp16-only FA2 build
+        # (see supports_combination for the dtype gate).
+        return capability >= DeviceCapability(7, 5)
 
     @classmethod
     def supports_combination(
@@ -216,6 +218,8 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> str | None:
         if has_sink and device_capability < DeviceCapability(9, 0):
             return "sink not supported on compute capability < 9.0"
+        if device_capability < DeviceCapability(8, 0) and dtype != torch.float16:
+            return "the sm75 FA2 build is fp16-only"
         return None
 
 
@@ -298,6 +302,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         else AttentionCGSupport.UNIFORM_BATCH
     )
     supports_update_block_table: bool = True
+    # FlashAttention's own DCP path reads each rank's context lengths. Subclass
+    # backends that run their own DCP attention can skip building them.
+    builds_dcp_context_lens: ClassVar[bool] = True
 
     @classmethod
     def get_cudagraph_support(
@@ -477,7 +484,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         suffix_kv_lens = None
         prefix_scheduler_metadata = None
 
-        if self.dcp_world_size > 1:
+        if self.dcp_world_size > 1 and self.builds_dcp_context_lens:
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
             context_kv_lens = seq_lens - query_lens
             local_context_kv_lens = get_dcp_local_seq_lens(

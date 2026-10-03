@@ -9,12 +9,19 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear.fp16_gemv_silu import Sm70Fp16GemvSiluKernel
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from .sm70_fp16_gemv import _exact_runtime_contract
+from .sm70_fp16_gemv import (
+    Qwen38SM70FP16LinearMethod,
+    _batch_runtime_contract,
+    _exact_runtime_contract,
+)
 
 logger = init_logger(__name__)
 
@@ -22,6 +29,88 @@ _HC_COUNT = 4
 _HC_DIM = 2560
 _HC_RANK = 320
 _HC_HIDDEN = _HC_COUNT * _HC_DIM
+
+
+def _mtp_batch_runtime_contract(vllm_config=None) -> bool:
+    if not _exact_runtime_contract(vllm_config) or envs.VLLM_BATCH_INVARIANT:
+        return False
+    config = vllm_config or get_current_vllm_config()
+    speculative = config.speculative_config
+    return bool(
+        speculative is not None
+        and getattr(speculative, "method", None) == "mtp"
+        # M=5/10 arithmetic is checked at dispatch, independently of draft width.
+        and not getattr(config.parallel_config, "use_ubatching", False)
+    )
+
+
+def _pack_hc_batch_weight(weight: torch.Tensor, role: str, rank: int) -> torch.Tensor:
+    """Lossless TP4 packs; keep checkpoint layout for M1 and prefill."""
+    if weight.dtype != torch.float16 or not 0 <= rank < 4:
+        raise ValueError("HC batch packing requires FP16 and a TP4 rank")
+    weight = weight.detach()
+    if role == "down" and weight.shape == (336, 10240):
+        padded = weight.new_zeros((96, 10240))
+        padded[:88].copy_(weight[rank * 80 : rank * 80 + 88])
+        return padded.reshape(3, 32, 640, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
+    if role == "up" and weight.shape == (10240, 320):
+        shard = weight.reshape(4, 2560, 320)[:, rank * 640 : (rank + 1) * 640]
+        return (
+            shard.contiguous()
+            .reshape(4, 80, 8, 20, 2, 8)
+            .permute(1, 3, 4, 0, 2, 5)
+            .contiguous()
+        )
+    raise ValueError("Unsupported HC batch weight role/geometry")
+
+
+def _prepare_hc_batch_weight(layer: nn.Module) -> None:
+    from vllm import _custom_ops as ops
+    from vllm.distributed.parallel_state import get_tp_group
+
+    weight = layer.weight
+    if not weight.is_cuda or weight.dtype != torch.float16:
+        return
+    if not ops.supports_sm70_qwen38_hc_batch():
+        raise RuntimeError("Rebuild the SM70 extension for batched HC")
+    rank = get_tp_group().rank_in_group
+    layer.register_buffer(
+        "_sm70_qwen38_hc_batch_packed",
+        _pack_hc_batch_weight(weight, layer._sm70_qwen38_hc_batch_role, rank),
+        persistent=False,
+    )
+
+
+def _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch=False) -> bool:
+    if x.ndim != 2:
+        return False
+    reduced = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+    admitted = (
+        envs.VLLM_SM70_QWEN38_BATCH_FASTPATH and not reduced and 2 <= x.shape[0] <= 16
+        if concurrent_batch
+        else envs.VLLM_SM70_MTP_HC_BATCH and reduced and x.shape[0] in (5, 10)
+    )
+    return bool(
+        admitted
+        and not envs.VLLM_BATCH_INVARIANT
+        and not torch.backends.cuda.matmul.allow_fp16_accumulation
+        and x.shape[1] == _HC_HIDDEN
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and packed_down is not None
+        and packed_up is not None
+        and packed_down.shape == (3, 640, 2, 32, 8)
+        and packed_up.shape == (80, 20, 2, 4, 8, 8)
+        and all(
+            w.device == x.device
+            and w.dtype == x.dtype
+            and w.is_contiguous()
+            and w.data_ptr() % 16 == 0
+            for w in (packed_down, packed_up)
+        )
+    )
 
 
 @triton.jit
@@ -277,7 +366,40 @@ def _qwen38_sm70_fp16_fused_hc(
     x: torch.Tensor,
     down_weight: torch.Tensor,
     up_weight: torch.Tensor,
+    packed_down: torch.Tensor | None = None,
+    packed_up: torch.Tensor | None = None,
+    concurrent_batch: bool = False,
+    reassociated_down: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch):
+        from vllm.distributed.parallel_state import get_tp_group
+
+        custom_ar = getattr(get_tp_group().device_communicator, "ca_comm", None)
+        if custom_ar is not None and custom_ar.can_sm70_qwen38_hc_batch(x):
+            m = x.shape[0]
+            partials = x.new_empty((20, m, 96), dtype=torch.float32)
+            lora, local_block, block, injection = (
+                x.new_empty((m, n)) for n in (320, 640, 2560, 4)
+            )
+            custom_ar.sm70_qwen38_hc_batch(
+                x,
+                packed_down,
+                packed_up,
+                partials,
+                lora,
+                local_block,
+                block,
+                injection,
+                round_down_partials=not concurrent_batch,
+                cooperative=not concurrent_batch and envs.VLLM_SM70_MTP_HC_COOPERATIVE,
+                full_unroll=not concurrent_batch and envs.VLLM_SM70_MTP_HC_FULL_UNROLL,
+                fused_chain=concurrent_batch,
+            )
+            logger.info_once(
+                "SM70 TP4 batched HC enabled (FP32 concurrent partials=%s).",
+                concurrent_batch,
+            )
+            return block, injection
     if not _runtime_ok(x, down_weight, up_weight):
         # Preserve the ordinary projection and FP16 materialization boundaries
         # for prefill and any unsupported runtime shape. This fallback lives
@@ -304,13 +426,27 @@ def _qwen38_sm70_fp16_fused_hc(
         local_down = x.new_empty((1, 88))
         gathered_down = x.new_empty((1, 336))
         block = x.new_empty((1, _HC_DIM))
-        _qwen38_hc_down_local_shard_kernel[(88,)](
-            x,
-            down_weight,
-            local_down,
-            TP_RANK=tp_rank,
-            num_warps=4,
-        )
+        if reassociated_down and Sm70Fp16GemvSiluKernel.can_implement(
+            x, down_weight, local_down, 81, 80, tp_rank * 80, 320 + tp_rank, 4.0
+        ):
+            Sm70Fp16GemvSiluKernel.apply_out(
+                x,
+                down_weight,
+                local_down,
+                81,
+                80,
+                prefix_start=tp_rank * 80,
+                suffix_start=320 + tp_rank,
+                divisor=4.0,
+            )
+        else:
+            _qwen38_hc_down_local_shard_kernel[(88,)](
+                x,
+                down_weight,
+                local_down,
+                TP_RANK=tp_rank,
+                num_warps=4,
+            )
         custom_ar.sm70_qwen38_hc_down_allgather(local_down, gathered_down)
         if custom_ar.supports_sm70_qwen38_hc_up_mix_allgather():
             custom_ar.sm70_qwen38_hc_up_mix_allgather(
@@ -356,17 +492,30 @@ def _qwen38_sm70_fp16_fused_hc(
     lora = x.new_empty((1, _HC_RANK))
     injection = x.new_empty((1, _HC_COUNT))
     block = x.new_empty((1, _HC_DIM))
-    _qwen38_hc_down_silu_inject_kernel[(_HC_RANK + _HC_COUNT,)](
-        x,
-        down_weight,
-        lora,
-        injection,
-        K=_HC_HIDDEN,
-        BLOCK_K=256,
-        RANK_VALUE=_HC_RANK,
-        HC_COUNT=_HC_COUNT,
-        num_warps=4,
-    )
+    if reassociated_down:
+        projected = x.new_empty((1, _HC_RANK + _HC_COUNT))
+        Sm70Fp16GemvSiluKernel.apply_out(
+            x,
+            down_weight,
+            projected,
+            _HC_RANK + _HC_COUNT,
+            _HC_RANK,
+            suffix_start=_HC_RANK,
+            divisor=float(_HC_COUNT),
+        )
+        lora, injection = projected[:, :_HC_RANK], projected[:, _HC_RANK:]
+    else:
+        _qwen38_hc_down_silu_inject_kernel[(_HC_RANK + _HC_COUNT,)](
+            x,
+            down_weight,
+            lora,
+            injection,
+            K=_HC_HIDDEN,
+            BLOCK_K=256,
+            RANK_VALUE=_HC_RANK,
+            HC_COUNT=_HC_COUNT,
+            num_warps=4,
+        )
     _qwen38_hc_up_gate_mix_row4_kernel[(triton.cdiv(_HC_DIM, 4),)](
         lora,
         up_weight,
@@ -387,8 +536,12 @@ def _qwen38_sm70_fp16_fused_hc_fake(
     x: torch.Tensor,
     down_weight: torch.Tensor,
     up_weight: torch.Tensor,
+    packed_down: torch.Tensor | None = None,
+    packed_up: torch.Tensor | None = None,
+    concurrent_batch: bool = False,
+    reassociated_down: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del down_weight, up_weight
+    del down_weight, up_weight, packed_down, packed_up
     return (
         x.new_empty((*x.shape[:-1], _HC_DIM)),
         x.new_empty((*x.shape[:-1], _HC_COUNT)),
@@ -410,16 +563,35 @@ def maybe_apply_qwen38_sm70_fp16_fused_hc(
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     if not enabled or not use_sm70_decode_graph_semantics():
         return None
+    # LoRA wrappers and quantized methods must retain their own forward path.
+    # Enabling unrelated FP16 projections must never bypass adapter updates.
+    if not all(
+        isinstance(layer, LinearBase)
+        and type(layer.quant_method)
+        in (UnquantizedLinearMethod, Qwen38SM70FP16LinearMethod)
+        for layer in (down_layer, up_layer)
+    ):
+        return None
     down_weight = getattr(down_layer, "weight", None)
     up_weight = getattr(up_layer, "weight", None)
     if down_weight is None or up_weight is None:
+        return None
+    if down_weight.dtype != torch.float16 or up_weight.dtype != torch.float16:
         return None
     if down_weight.shape != (
         _HC_RANK + _HC_COUNT + 12,
         _HC_HIDDEN,
     ) or up_weight.shape != (_HC_HIDDEN, _HC_RANK):
         return None
-    return torch.ops.vllm.qwen38_sm70_fp16_fused_hc(x, down_weight, up_weight)
+    return torch.ops.vllm.qwen38_sm70_fp16_fused_hc(
+        x,
+        down_weight,
+        up_weight,
+        getattr(down_layer, "_sm70_qwen38_hc_batch_packed", None),
+        getattr(up_layer, "_sm70_qwen38_hc_batch_packed", None),
+        getattr(down_layer, "_sm70_qwen38_hc_batch_concurrent", False),
+        getattr(down_layer, "_sm70_fp16_gemv_silu_ranges", False),
+    )
 
 
 def enable_qwen38_sm70_fp16_fused_hc(
@@ -436,6 +608,9 @@ def enable_qwen38_sm70_fp16_fused_hc(
         return
 
     enabled_count = 0
+    tp4 = (
+        vllm_config or get_current_vllm_config()
+    ).parallel_config.tensor_parallel_size == 4
     for child in module.modules():
         if not (
             getattr(child, "use_combine", False)
@@ -447,6 +622,47 @@ def enable_qwen38_sm70_fp16_fused_hc(
         ):
             continue
         child._sm70_qwen38_fp16_fused_hc = True
+        # The generic operator changes FP32 reduction association. Enable it
+        # for the quality-equivalent no-speculative policy; verifier/draft and
+        # batch-invariant execution retain their existing reductions.
+        config = vllm_config or get_current_vllm_config()
+        child.input_mix_weight_down_block_inject._sm70_fp16_gemv_silu_ranges = (
+            config.speculative_config is None and not envs.VLLM_BATCH_INVARIANT
+        )
+        fp32_partials = (
+            not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+        )
+        concurrent_batch = bool(
+            envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
+            and _batch_runtime_contract(vllm_config)
+            and tp4
+            # The default worker disables FP16 partial reductions. Reuse the
+            # batch operator's FP32-partial schedule for that MTP policy rather
+            # than falling back to two full, replicated projections. The
+            # legacy FP16-partial policy retains its own qualified schedule.
+            and (
+                not _mtp_batch_runtime_contract(vllm_config)
+                or (envs.VLLM_SM70_MTP_HC_BATCH and fp32_partials)
+            )
+        )
+        # Only HC's packed collective owns exactly four TP shards. Local router
+        # and shared-expert kernels use the independent MTP admission above.
+        if tp4 and (
+            concurrent_batch
+            or (
+                envs.VLLM_SM70_MTP_HC_BATCH and _mtp_batch_runtime_contract(vllm_config)
+            )
+        ):
+            for role, layer in (
+                ("down", child.input_mix_weight_down_block_inject),
+                ("up", child.input_mix_weight_up),
+            ):
+                if type(layer.quant_method) is UnquantizedLinearMethod:
+                    layer.quant_method = Qwen38SM70FP16LinearMethod()
+                if not isinstance(layer.quant_method, Qwen38SM70FP16LinearMethod):
+                    raise RuntimeError("Batched HC requires checkpoint-FP16 linears")
+                layer._sm70_qwen38_hc_batch_role = role
+                layer._sm70_qwen38_hc_batch_concurrent = concurrent_batch
         enabled_count += 1
 
     if enabled_count:

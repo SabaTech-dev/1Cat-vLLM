@@ -9,10 +9,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-import vllm.envs as envs
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
+from vllm.config.sm70_dflash2 import (
+    capture_sm70_dflash2_config,
+    sm70_dflash2_enabled,
+)
 from vllm.config.speculative import get_dflash_model_draft_tokens
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
@@ -57,11 +60,15 @@ def _use_sm70_bf16_emulation(config) -> bool:
     }
     enabled = os.getenv("VLLM_SM70_DFLASH2_BF16_EMULATION", "1").strip().lower()
     enabled = enabled in ("1", "true", "yes", "on")
-    return (
-        enabled
-        and is_bf16
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability(70)
+    if not (enabled and is_bf16 and current_platform.is_cuda()):
+        return False
+    # Native BF16 arithmetic arrives with SM80. Volta and Turing both run the
+    # draft in FP16, so both need the range-preserving path: the criterion is
+    # the missing capability, not one architecture number. Ask the device this
+    # worker builds on; device 0 of the visibility list may be another card on
+    # a node that mixes architectures.
+    return not current_platform.has_device_capability(
+        80, device_id=torch.accelerator.current_device_index()
     )
 
 
@@ -74,7 +81,12 @@ def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | Non
     """
     if not current_platform.is_cuda():
         return None
-    if not current_platform.has_device_capability(80):
+    # Same rule as _use_sm70_bf16_emulation: ask the worker's own device, not
+    # device 0 of the visibility list; the cache is per process, i.e. per
+    # worker.
+    if not current_platform.has_device_capability(
+        80, device_id=torch.accelerator.current_device_index()
+    ):
         logger.info_once(
             "DFlash2 disables FlashInfer top-k below SM80; using torch.topk."
         )
@@ -342,7 +354,9 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
         prefix: str,
     ) -> nn.Module:
         use_sharded_fc = (
-            envs.VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC
+            sm70_dflash2_enabled(
+                "sharded_context_fc", capture_sm70_dflash2_config(vllm_config)
+            )
             and self.quant_config is None
             and current_platform.is_cuda()
             and current_platform.is_device_capability(70)
@@ -445,6 +459,7 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._sm70_dflash2_policy = capture_sm70_dflash2_config(vllm_config)
         draft_config = self.config.dflash_config
         self.output_multiplier = float(draft_config.get("output_multiplier", 1.0))
         softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
@@ -461,7 +476,7 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
         )
         if not unquantized_head:
-            if not envs.VLLM_SM70_DFLASH2_QUANT_LM_HEAD:
+            if not sm70_dflash2_enabled("quant_lm_head", self._sm70_dflash2_policy):
                 raise ValueError(
                     "DFlash2 requires an unquantized target LM head for "
                     "candidate TopK; got "

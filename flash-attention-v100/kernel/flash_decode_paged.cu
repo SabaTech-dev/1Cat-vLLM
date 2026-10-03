@@ -2073,13 +2073,17 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
       query_len > MAX_QUERY_TOKENS) {
     return;
   }
+  if constexpr (ROW_SEQLENS) {
+    row_lengths += static_cast<int64_t>(group_idx) * MAX_QUERY_TOKENS;
+  }
 
   if constexpr (!SPARSE_PAGE4) {
     partial_out += static_cast<int64_t>(group_idx) * Traits::kSplits *
                    MAX_QUERY_TOKENS * kGroupedVerifyHeads *
                    kGroupedVerifyHeadDim;
     partial_lse += static_cast<int64_t>(group_idx) * Traits::kSplits *
-                   MAX_QUERY_TOKENS * kGroupedVerifyHeads;
+                   MAX_QUERY_TOKENS * kGroupedVerifyHeads *
+                   (ROW_SEQLENS ? 2 : 1);
   }
 
   int total_kv = seq_lens[group_idx];
@@ -2244,6 +2248,23 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
         reinterpret_cast<uint4*>(shared_kv)[idx] = make_uint4(0, 0, 0, 0);
       }
       __syncthreads();
+      // W12: defensively zero K rows no query attends (see the V panel below).
+      // K NaN is already masked out of the scores by
+      // grouped_verify_key_visible, but zeroing keeps the loaded panel free of
+      // the null block's E4M3 NaN. Masks are visible after the __syncthreads()
+      // above; the one added inside publishes the zeros before
+      // grouped_verify_qk consumes shared_kv.
+      if constexpr (SPARSE_PAGE4) {
+        for (int idx = tid; idx < valid_k_rows * kSharedStrideVec;
+             idx += kGroupedVerifyThreads) {
+          const int row = idx / kSharedStrideVec;
+          const uint32_t token_mask = smem.sparse_token_masks[row >> 2];
+          if ((token_mask & (0x11111111u << (row & 3))) == 0) {
+            reinterpret_cast<uint4*>(shared_kv)[idx] = make_uint4(0, 0, 0, 0);
+          }
+        }
+        __syncthreads();
+      }
 
       int active_m_tiles = 0x7;
       if constexpr (SPARSE_PAGE4) {
@@ -2335,6 +2356,22 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
       reinterpret_cast<uint4*>(shared_kv)[idx] = make_uint4(0, 0, 0, 0);
     }
     __syncthreads();
+    // W12: defensively zero K rows no query attends (see the V panel below).
+    // K NaN is already masked out of the scores by grouped_verify_key_visible,
+    // but zeroing keeps the loaded panel free of the null block's E4M3 NaN.
+    // Masks are visible after the __syncthreads() above; the one added inside
+    // publishes the zeros before grouped_verify_qk consumes shared_kv.
+    if constexpr (SPARSE_PAGE4) {
+      for (int idx = tid; idx < valid_k_rows * kSharedStrideVec;
+           idx += kGroupedVerifyThreads) {
+        const int row = idx / kSharedStrideVec;
+        const uint32_t token_mask = smem.sparse_token_masks[row >> 2];
+        if ((token_mask & (0x11111111u << (row & 3))) == 0) {
+          reinterpret_cast<uint4*>(shared_kv)[idx] = make_uint4(0, 0, 0, 0);
+        }
+      }
+      __syncthreads();
+    }
 
     int active_m_tiles = 0x7;
     if constexpr (COMPENSATE_P) {
@@ -2462,6 +2499,28 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
          idx < kGroupedVerifyBlockN * kSharedStrideVec;
          idx += kGroupedVerifyThreads) {
       reinterpret_cast<uint4*>(shared_kv)[idx] = make_uint4(0, 0, 0, 0);
+    }
+    // W12: the grouped planner pads each category to a multiple of 8 with
+    // (physical microblock 0 = null block, mask 0) and counts the padding in
+    // seq_len; the forward also carries unselected tokens inside partial
+    // microblocks. Such rows get P=0, but 0 * NaN survives the P@V MMA when
+    // page 0 holds fp16 GDN state that decodes to E4M3 NaN (W8). Zero every
+    // row no query attends (mask bit = query*4 + token_in_microblock, so the
+    // row is unattended iff (mask & (0x11111111u << (row & 3))) == 0) so the
+    // reduction sees 0 * 0 = 0. The leading __syncthreads() makes the V panel
+    // load finish before we overwrite its page-0 rows (else the load races past
+    // the zero and resurrects the NaN); the trailing one publishes the zeros
+    // before P@V. Masks were synced earlier in this iteration.
+    if constexpr (SPARSE_PAGE4) {
+      __syncthreads();
+      for (int idx = tid; idx < valid_k_rows * kSharedStrideVec;
+           idx += kGroupedVerifyThreads) {
+        const int row = idx / kSharedStrideVec;
+        const uint32_t token_mask = smem.sparse_token_masks[row >> 2];
+        if ((token_mask & (0x11111111u << (row & 3))) == 0) {
+          reinterpret_cast<uint4*>(shared_kv)[idx] = make_uint4(0, 0, 0, 0);
+        }
+      }
     }
     __syncthreads();
 
@@ -2633,10 +2692,13 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
   partial_out += static_cast<int64_t>(request_idx) * Traits::kSplits *
                  MAX_QUERY_TOKENS * kGroupedVerifyHeads * kGroupedVerifyHeadDim;
   partial_lse += static_cast<int64_t>(request_idx) * Traits::kSplits *
-                 MAX_QUERY_TOKENS * kGroupedVerifyHeads;
+                 MAX_QUERY_TOKENS * kGroupedVerifyHeads * (ROW_SEQLENS ? 2 : 1);
   seq_lens += request_idx;
   out += static_cast<int64_t>(request_idx) * query_len * kGroupedVerifyHeads *
          kGroupedVerifyHeadDim;
+  if constexpr (ROW_SEQLENS) {
+    row_lengths += static_cast<int64_t>(request_idx) * MAX_QUERY_TOKENS;
+  }
 
   int total_kv = seq_lens[0];
   if constexpr (ROW_SEQLENS) {
@@ -2656,7 +2718,7 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
       grouped_verify_active_splits<MAX_QUERY_TOKENS, SINGLE_QUERY>(total_kv);
   __shared__ float split_lse[Traits::kSplits];
   __shared__ float split_sum[ROW_SEQLENS ? Traits::kSplits : 1];
-  __shared__ float final_max;
+  __shared__ float split_weight[Traits::kSplits];
   __shared__ float final_inv_sum;
 
   if (threadIdx.x < Traits::kSplits) {
@@ -2685,6 +2747,9 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
     for (int split = 0; split < active_splits; ++split) {
       if (split_lse[split] > -1.0e20f) {
         const float weight = __expf(fmaxf(split_lse[split] - max_lse, -80.0f));
+        // Every output dimension uses the same partition weight. Reuse the
+        // value computed for the denominator without changing reduction order.
+        split_weight[split] = weight;
         if constexpr (ROW_SEQLENS) {
           sum = fmaf(weight, split_sum[split], sum);
         } else {
@@ -2692,7 +2757,6 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
         }
       }
     }
-    final_max = max_lse;
     final_inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
   }
   __syncthreads();
@@ -2702,8 +2766,7 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
     float accumulator = 0.0f;
     for (int split = 0; split < active_splits; ++split) {
       if (split_lse[split] > -1.0e20f) {
-        const float weight =
-            __expf(fmaxf(split_lse[split] - final_max, -80.0f)) * final_inv_sum;
+        const float weight = split_weight[split] * final_inv_sum;
         const int64_t partial_idx =
             (((static_cast<int64_t>(split) * MAX_QUERY_TOKENS + token_idx) *
                   kGroupedVerifyHeads +
@@ -3542,11 +3605,13 @@ void launch_flash_attention_decode_paged(
                 "anchored decode window requires an fp16 KV cache");
     if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 && D == 256 &&
                   PARTITION_SIZE == 1024 && std::is_same_v<PARTIAL_T, float>) {
-      const char* enabled = std::getenv("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST");
-      const bool use_fast = enabled && enabled[0] == '1' &&
-                            enabled[1] == '\0' && batch_size == 8 &&
-                            num_heads_q == 12 && num_heads_kv == 2 &&
-                            window_size_left == -1 && window_size_right == -1;
+      const char* enabled = std::getenv("VLLM_FLASH_V100_E4M3_SCALAR_FAST");
+      if (enabled == nullptr) {
+        enabled = std::getenv("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST");
+      }
+      const bool use_fast =
+          (enabled == nullptr || (enabled[0] == '1' && enabled[1] == '\0')) &&
+          window_size_left == -1 && window_size_right == -1;
       if (use_fast) {
         tp2_e4m3_scalar_fast_calls.fetch_add(1, std::memory_order_relaxed);
         launch_partition(std::false_type{}, std::true_type{});
@@ -4392,34 +4457,40 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
     float scale, float k_scale, float v_scale) {
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf &&
                   q.is_contiguous() && q.dim() == 3 && q.size(0) >= 2 &&
-                  q.size(0) <= 8 && q.size(1) == 6 && q.size(2) == 256,
-              "E4M3 grouped FP32 requires contiguous CUDA FP16 Q [2..8,6,256]");
+                  q.size(1) > 0 && q.size(1) % 6 == 0 && q.size(2) == 256,
+              "E4M3 grouped FP32 requires CUDA FP16 Q [rows,6*Hkv,256]");
   TORCH_CHECK(
-      k.dim() == 4 && k.size(2) == 1 && k.size(3) == 256 &&
-          (k.size(1) == 800 || k.size(1) == 848 || k.size(1) == 1616 ||
-           k.size(1) == 1648 || k.size(1) == 1728 || k.size(1) == 3296 ||
-           k.size(1) == 3456) &&
+      k.dim() == 4 && k.size(2) * 6 == q.size(1) && k.size(3) == 256 &&
+          k.size(1) > 0 && k.size(1) % 16 == 0 &&
           k.scalar_type() == at::kByte && v.scalar_type() == at::kByte &&
           v.sizes() == k.sizes(),
-      "E4M3 grouped FP32 requires supported uint8 paged KV [pages,page,1,256]");
+      "E4M3 grouped FP32 requires uint8 KV [pages,16-aligned-page,Hkv,256]");
+  const int64_t batch_size = block_table.dim() == 2 ? block_table.size(0) : 0;
   TORCH_CHECK(
-      block_table.dim() == 2 && block_table.size(0) == 1 &&
+      block_table.dim() == 2 && batch_size >= 1 && batch_size <= 16 &&
           block_table.is_contiguous() &&
           block_table.scalar_type() == at::kInt && block_table.size(1) > 0 &&
           block_table.size(1) * k.size(1) <= 266240 &&
+          q.size(0) % batch_size == 0 &&
+          (batch_size == 1 ? q.size(0) <= 8 : q.size(0) == batch_size * 8) &&
           row_lengths.sizes() == at::IntArrayRef({q.size(0)}) &&
           row_lengths.scalar_type() == at::kInt && row_lengths.is_contiguous(),
-      "E4M3 grouped FP32 requires one KV sequence and per-query int32 lengths");
+      "E4M3 grouped FP32 requires q2..8/B1 or request-major q8/B2..16 "
+      "and per-query int32 lengths");
   TORCH_CHECK(out.sizes() == q.sizes() && out.is_contiguous() &&
                   out.scalar_type() == at::kHalf,
               "E4M3 grouped FP32 output must be contiguous FP16 and Q-shaped");
-  TORCH_CHECK(partial.sizes() == at::IntArrayRef({80, 8, 6, 256}) &&
-                  partial.is_contiguous() &&
-                  partial.scalar_type() == at::kFloat &&
-                  lse.sizes() == at::IntArrayRef({80, 8, 6, 2}) &&
-                  lse.is_contiguous() && lse.scalar_type() == at::kFloat,
-              "E4M3 grouped FP32 requires numerator [80,8,6,256] and max/sum "
-              "[80,8,6,2]");
+  const bool workspace_shapes =
+      batch_size == 1
+          ? (partial.sizes() == at::IntArrayRef({80, 8, 6, 256}) &&
+             lse.sizes() == at::IntArrayRef({80, 8, 6, 2}))
+          : (partial.sizes() == at::IntArrayRef({batch_size, 80, 8, 6, 256}) &&
+             lse.sizes() == at::IntArrayRef({batch_size, 80, 8, 6, 2}));
+  TORCH_CHECK(workspace_shapes && partial.is_contiguous() &&
+                  partial.scalar_type() == at::kFloat && lse.is_contiguous() &&
+                  lse.scalar_type() == at::kFloat,
+              "E4M3 grouped FP32 requires request-major FP32 numerator "
+              "and max/sum workspaces");
   TORCH_CHECK(
       std::isfinite(scale) && std::isfinite(k_scale) &&
           std::isfinite(v_scale) && k_scale > 0 && v_scale > 0,
@@ -4446,6 +4517,22 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
               "E4M3 grouped FP32 supports SM70 only");
+  if (k.size(2) > 1) {
+    // KV heads are independent. Retain the validated FP32 reduction for each
+    // GQA6 group, including causal row lengths and arbitrary cache strides.
+    // The shared partial workspace is reused in current-stream order.
+    for (int64_t head = 0; head < k.size(2); ++head) {
+      auto group_q = q.narrow(1, head * 6, 6).contiguous();
+      auto group_k = k.narrow(2, head, 1);
+      auto group_v = v.narrow(2, head, 1);
+      auto group_out = at::empty_like(group_q);
+      flash_attention_grouped_e4m3_fp32_paged(
+          group_q, group_k, group_v, group_out, block_table, row_lengths,
+          partial, lse, scale, k_scale, v_scale);
+      out.narrow(1, head * 6, 6).copy_(group_out);
+    }
+    return out;
+  }
   // A contiguous FP16 view can start at a half-element storage offset.
   // The shared-Q feed uses uint4 loads; only those exceptional views need
   // an aligned, stream-local copy. Ordinary model Q keeps the original path.
@@ -4465,19 +4552,20 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
                            kCompensatedSmemBytes));
   C10_CUDA_CHECK(cudaFuncSetAttribute(
       kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-  kernel<<<dim3(1, 80), kGroupedVerifyThreads, kCompensatedSmemBytes, stream>>>(
+  kernel<<<dim3(1, 80, batch_size), kGroupedVerifyThreads,
+           kCompensatedSmemBytes, stream>>>(
       reinterpret_cast<const __half*>(aligned_q.data_ptr()), k.data_ptr(),
       v.data_ptr(), block_table.data_ptr<int>(), row_lengths.data_ptr<int>(),
-      partial.data_ptr<float>(), lse.data_ptr<float>(), q.size(0),
+      partial.data_ptr<float>(), lse.data_ptr<float>(), q.size(0) / batch_size,
       block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
       v.stride(0), v.stride(1), v.stride(2), scale * k_scale, v_scale, nullptr,
-      1, row_lengths.data_ptr<int>());
+      static_cast<int>(batch_size), row_lengths.data_ptr<int>());
   flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true>
-      <<<dim3(q.size(0), 6), kGroupedVerifyThreads, 0, stream>>>(
-          partial.data_ptr<float>(), lse.data_ptr<float>(),
-          row_lengths.data_ptr<int>(),
-          reinterpret_cast<__half*>(out.data_ptr()), q.size(0),
-          row_lengths.data_ptr<int>());
+      <<<dim3(q.size(0) / batch_size, 6, batch_size), kGroupedVerifyThreads, 0,
+         stream>>>(partial.data_ptr<float>(), lse.data_ptr<float>(),
+                   row_lengths.data_ptr<int>(),
+                   reinterpret_cast<__half*>(out.data_ptr()),
+                   q.size(0) / batch_size, row_lengths.data_ptr<int>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
@@ -4486,10 +4574,12 @@ int64_t flash_attention_grouped_e4m3_fp32_precision_version() {
   // Revision 3 retains unnormalized FP32 numerators and separate max/sum.
   // Older normalized-partial/LSE workspaces are not ABI-compatible.
   // Revision 4 admits DFlash2 1728/3456 pages and FP32 scalar E4M3 partials.
-  return 4;
+  // Revision 5 admits multiple local KV heads and runtime aligned page sizes.
+  // Revision 6 admits request-major batches of up to sixteen q8 verifiers.
+  return 6;
 }
 
-int64_t flash_attention_tp2_e4m3_scalar_fast_version() { return 2; }
+int64_t flash_attention_tp2_e4m3_scalar_fast_version() { return 3; }
 
 int64_t flash_attention_tp2_e4m3_scalar_fast_launch_count() {
   // Includes capture-time launches; CUDA Graph replay does not call this host
@@ -5174,9 +5264,8 @@ at::Tensor flash_attention_decode_paged_xqa(
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
     const bool e4m3_batch_allowed = q.size(0) > 1 && xqa_e4m3_batch_enabled();
-    const bool e4m3_aligned_page = k_cache.size(1) >= 256 &&
-                                   k_cache.size(1) % 16 == 0 &&
-                                   k_cache.size(2) == 1;
+    const bool e4m3_aligned_page =
+        k_cache.size(1) >= 256 && k_cache.size(1) % 16 == 0;
     const bool use_large_partition =
         q.size(0) == 1 &&
         (partition_size == 512 || partition_size == 896 ||
@@ -5188,12 +5277,12 @@ at::Tensor flash_attention_decode_paged_xqa(
                 "E4M3 XQA supports B=1, or B>=2 when "
                 "VLLM_FLASH_V100_E4M3_BATCH_XQA=1; q_per_kv=6 and D=256 are "
                 "required. A 16-aligned page with at least 256 tokens and "
-                "Hkv=1 additionally supports B1 partition sizes 512, 896, "
+                "additionally supports B1 partition sizes 512, 896, "
                 "1024, and 1664");
     const bool e4m3_batch_optimized =
         q.size(0) > 1 && xqa_e4m3_batch_optimized_enabled() &&
         k_cache.size(1) >= 256 && k_cache.size(1) % 16 == 0 &&
-        k_cache.size(2) == 1 && k_cache.scalar_type() == at::kByte;
+        k_cache.scalar_type() == at::kByte;
     const XQABatchContextRoute e4m3_batch_route =
         e4m3_batch_optimized && batch_context_max_seq_len > 0 && q.size(0) >= 4
             ? select_xqa_batch_context_route(
