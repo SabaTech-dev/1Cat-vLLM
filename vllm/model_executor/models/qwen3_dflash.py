@@ -951,13 +951,32 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 "means the draft model's target_layer_ids reference layers that "
                 "do not exist in the target model (incompatible draft/target pair)."
             )
-        # AWQ target paths can surface fp32 auxiliary states even when the
-        # draft projection is initialized in fp16. Match the FC weight dtype
-        # before dispatching the linear kernel.
         fc_weight = getattr(self.model.fc, "weight", None)
-        if fc_weight is not None and hidden_states.dtype != fc_weight.dtype:
-            hidden_states = hidden_states.to(dtype=fc_weight.dtype)
-        result = self.model.fc(hidden_states)
+
+        def _project(chunk: torch.Tensor) -> torch.Tensor:
+            # AWQ target paths can surface fp32 auxiliary states even when the
+            # draft projection is initialized in fp16. Match the FC weight dtype
+            # before dispatching the linear kernel.
+            if fc_weight is not None and chunk.dtype != fc_weight.dtype:
+                chunk = chunk.to(dtype=fc_weight.dtype)
+            return self.model.fc(chunk)
+
+        # Project in row chunks: casting a whole-prefill aux hidden tensor at
+        # once materializes a second full-size copy and OOMs the worker when
+        # VRAM headroom is tight (observed on SM70 under batched prefill,
+        # 27-oct-2026: 286 MiB alloc with 203 MiB free on GPU 1). Row-wise
+        # chunking is numerically equivalent for the FC projection.
+        row_chunk = 4096
+        if hidden_states.shape[0] > row_chunk:
+            result = torch.cat(
+                [
+                    _project(hidden_states[i : i + row_chunk])
+                    for i in range(0, hidden_states.shape[0], row_chunk)
+                ],
+                dim=0,
+            )
+        else:
+            result = _project(hidden_states)
         if needs_squeeze:
             result = result.squeeze(0)
         return result
