@@ -337,6 +337,7 @@ else()
   set(VLLM_EXT_SRC
     "csrc/cuda_view.cu"
     "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
+    "csrc/quantization/activation_kernels.cu"
     "csrc/cuda_utils_kernels.cu"
     "csrc/custom_all_reduce.cu"
     "csrc/torch_bindings.cpp"
