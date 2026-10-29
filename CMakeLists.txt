@@ -337,11 +337,20 @@ else()
   set(VLLM_EXT_SRC
     "csrc/cuda_view.cu"
     "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu"
-    "csrc/quantization/activation_kernels.cu"
     "csrc/cuda_utils_kernels.cu"
     "csrc/custom_all_reduce.cu"
     "csrc/torch_bindings.cpp"
     "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu")
+endif()
+
+# The DeepGEMM fp8 MoE act-quant ops live in activation_kernels.cu, which is
+# only compiled when an SM80+ target is present (bf16 packed intrinsics).
+# Compile their registrations out of torch_bindings for SM70-only builds so
+# _C links without the file; the ops are runtime-dead on Volta anyway.
+if(_VLLM_HAS_SM80)
+  set(VLLM_REGISTER_DEEPGEMM_MOE_OPS ON)
+else()
+  set(VLLM_REGISTER_DEEPGEMM_MOE_OPS OFF)
 endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
@@ -739,6 +748,9 @@ define_extension_target(
 # driver API. This causes problems when linking with earlier versions of CUDA.
 # Setting this variable sidesteps the issue by calling the driver directly.
 target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
+if(VLLM_REGISTER_DEEPGEMM_MOE_OPS)
+  target_compile_definitions(_C PRIVATE VLLM_REGISTER_DEEPGEMM_MOE_OPS=1)
+endif()
 if(VLLM_REGISTER_BASIC_ACTIVATION_IN_C)
   target_compile_definitions(_C PRIVATE VLLM_REGISTER_BASIC_ACTIVATION_IN_C=1)
 endif()
