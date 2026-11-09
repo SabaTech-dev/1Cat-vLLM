@@ -92,3 +92,27 @@ Soporte GGUF verificado EN la wheel v1.5.2 (grep local): loader + adapters `qwen
 Lectura: (1) en single, IQ3_S GGUF EMPATA con NVFP4 a nivel de operador (en V100 ambos van por kernels custom — no hay FP4 tensor cores; NVFP4 se decodifica a FP16/FP32 igual). (2) En alta concurrencia NO hay datos GGUF: toda la ingenieria de concurrencia del release (DFlash2 C4/C8 #697, mixed-prefill #860, sampler sin syncs, verificacion conjunta) es NVFP4; el GGUF release-wheel es target-only sin spec verificado y con dequant por request -> hipotesis: pierde mas al subir concurrencia, SIN medicion que lo confirme. (3) El adapter MoE GGUF (35B-A3B) ni esta cualificado.
 
 EXPERIMENTO PROPIO propuesto (cierra la pregunta con datos): misma ventana, mismo base Qwen3.8-27B — NVFP4-BF16-LMHead vs GGUF Q4_K_M (~16-17GB ambos) — single x3 + multi6 + sonda tg128 c1/c4/c8/c16 con el protocolo de gates ya montado.
+
+
+## ANEXO FINAL 09-nov: veredicto del A/B — la wheel 1.5.2 NO arranca NINGUN formato en TP2
+
+Matriz completa de arranque probada en nuestro rig (2xV100 PCIe TP2, wheel 1.5.2+cu128, gates duros):
+
+| Formato / checkpoint | Intentos | Resultado | Error raiz |
+|---|---|---|---|
+| NVFP4 coder390 (lm_head cuantizado) | 6/6 crash | NO ARRANCA | AttributeError '_layer_execution_policy' (linear.py:375) |
+| NVFP4 RadixArk BF16-LMHead | 5/5 crash | NO ARRANCA | EL MISMO AttributeError — no es del lm_head |
+| GGUF Q4_K_M (DavidAU, qwen35 dense) | 3/3 crash | NO ARRANCA | 'VocabParallelEmbedding' has no attribute 'qweight' + uninitialized parameter |
+| GGUF IQ4_XS (mismo DavidAU) | en curso | NO ARRANCA (mismo error raiz verificado) | identical al Q4_K_M |
+| AWQ-INT4 (hotdogs, cyankiwi) | 12/12 crash | NO ARRANCA | Requiere sm_75+ (V100=sm_70) — por diseño |
+
+PATRON UNIFICADOR: fallo sistémico de inicialización de pesos en TP2 a través de TODOS los
+formatos (NVFP4, GGUF en ambos cuants) + AWQ excluida por arquetipo (sm75+). La v1.5.1 SÍ
+funcionó en este rig exacto (#1202: QUASAR NVFP4 TP2 completo) -> REGRESIÓN de la 1.5.2 en el
+camino de inicialización de pesos TP2 (probablemente el refactor de execution-policy/weight-
+processing no cubre la rama TP2). Además #1220 (main post-1.5.1): OOM TP2 en captura de graphs.
+
+CONSECUENCIA: prod permanece en sprint v1.5.1.dev91 (Modo A). La wheel 1.5.2 es INUTILIZABLE
+en V100 TP2 hoy, en cualquier formato de checkpoint. El issue upstream se reframa: no es un bug
+de un cuant — es una regresión TP2 transversal de la 1.5.2 con causa raiz identificada
+(LinearBase vs ParallelLMHead/VocabParallelEmbedding) + qweight en el loader GGUF + sm75 en AWQ.
