@@ -116,3 +116,10 @@ CONSECUENCIA: prod permanece en sprint v1.5.1.dev91 (Modo A). La wheel 1.5.2 es 
 en V100 TP2 hoy, en cualquier formato de checkpoint. El issue upstream se reframa: no es un bug
 de un cuant — es una regresión TP2 transversal de la 1.5.2 con causa raiz identificada
 (LinearBase vs ParallelLMHead/VocabParallelEmbedding) + qweight en el loader GGUF + sm75 en AWQ.
+
+
+## ANEXO FINAL (II) 09-nov: Tiel-Coder MoE confirma el fallo — flags de prod aplicados
+- El Tiel-Coder-35B-A3B (peculiar-ragdoll, qwen35moe, UD-IQ4_XS, MTP embebido, 3M descargas) crash-loopa en la wheel con LA MISMA firma ('VocabParallelEmbedding has no attribute qweight' + uninitialized parameter) -> el bug de init GGUF afecta a dense Y MoE en TP1/TP2.
+- Unit de test recreado con el set COMPLETO de flags de prod (KV e5m2, parsers qwen3/qwen3_coder, batched-tokens 8192, prefix-caching, limit-mm 0) por orden Joker — el fallo persiste: no era configuracion.
+- Comentario anadido a #1465 con esta confirmacion. Unidad aparcada (instalada, arrancable post-fix).
+- Estado: prod TP1 sprint sirviendo en :8009 (KV 226,9K tokens — capacidad 1 @200K full / mixta); decision pendiente del dueno: restaurar TP2 (5 @200K) o mantener el split mientras tanto. Alternativa madura para el Tiel: llama.cpp en :8001 (su familia Ornith ya corre ahi).
