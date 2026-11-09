@@ -3,7 +3,22 @@
 > Estado: DRAFT para revisión de Joker. Si da GO, publicar en 1CatAI/1Cat-vLLM (ref: flujo #865).
 > Evidencia completa: /tmp/opencode/ab152/legs/ (journal-B4-fail.log, journal-C-boot-fail.log) + dumps.
 
-**Title**: `[Bug] 1.5.2 wheel fails to boot with quantized lm_head — AttributeError: 'ParallelLMHead' object has no attribute '_layer_execution_policy'`
+**Title**: `[Bug] 1.5.2 wheel: engine init crashes on TP2 (2×V100 PCIe) across quantization formats — regression vs v1.5.1`
+
+**Complete boot matrix on our rig (2× V100-32GB PCIe, TP2, wheel 1.5.2+cu128, deterministic):**
+
+| Format / checkpoint | Attempts | Result | Root error |
+|---|---|---|---|
+| NVFP4 coder390 (quantized lm_head) | 6/6 crash | NO BOOT | `AttributeError: 'ParallelLMHead' object has no attribute '_layer_execution_policy'` (linear.py:375) |
+| NVFP4 RadixArk **BF16-LMHead** | 5/5 crash | NO BOOT | **same AttributeError** — not lm_head-related |
+| GGUF Q4_K_M dense qwen35 (DavidAU) | 3/3 crash | NO BOOT | `'VocabParallelEmbedding' object has no attribute 'qweight'` + uninitialized parameter |
+| GGUF IQ4_XS (same base) | crash-loop | NO BOOT | **identical to Q4_K_M** |
+| AWQ-INT4 compressed-tensors (hotdogs, cyankiwi) | 12/12 crash | NO BOOT | `Quantization scheme is not supported... Min capability: 75` (V100 = sm_70, by design) |
+
+**Unified diagnosis**: systemic TP2 weight-initialization breakage across NVFP4 and GGUF
+(embedding/lm_head processing), plus AWQ-INT4 requiring Turing+. **v1.5.1 booted and served
+NVFP4 on this exact rig** (see community benchmark #1202) → 1.5.2 regression in the TP2
+weight-processing path. main HEAD (checked) still lacks the fix.
 
 **Environment**
 - 2× V100-32GB (PCIe), TP=2, driver 580.178.04, Ubuntu, Python 3.12
