@@ -76,3 +76,19 @@ Soporte GGUF verificado EN la wheel v1.5.2 (grep local): loader + adapters `qwen
 2. **Qwopus3.8 Coder-Flash `Q4_K_M`**: coder fresco con visión; probar text-only primero.
 3. **Los dos APEX de IsValorum**: un solo boot de verificación cada uno para documentar el rechazo (y pedir en su repo quants IQ4_XS/Q4_K_M, que sí están soportados).
 4. Bonus: todos son familia Qwen3.8-27B → el draft `incoai/Qwen3.8-27B-DFlash2-GGUF` es compatible como speculative draft (soporte GGUF-draft en release sin verificar — probar tras target-only OK).
+
+
+## ANEXO 09-nov (III): GGUF vs NVFP4 — velocidad single y multi-stream (lo documentado)
+
+1Cat NO publica head-to-head GGUF vs NVFP4. Lo existente (builds distintos, no sumables):
+
+| Formato | Modelo | Workload | Resultado | Contrato |
+|---|---|---|---|---|
+| GGUF IQ3_S + MTP4 FP16 | Flash-Next | C1 8K/256 | 92,267 tok/s | dev build #940, 4xV100 TP4 |
+| NVFP4 + MTP4 | Flash-Next | C1 8K/256 | 92,199 tok/s | #796 |
+| GGUF IQ3_S + MTP4 | Flash-Next | C4 128/1024 | 280,441 agreg | dev build #940 |
+| NVFP4 + DFlash2 | 27B QUASAR | C4/C8 32K/256 | 429 / 625 agreg | #697 release |
+
+Lectura: (1) en single, IQ3_S GGUF EMPATA con NVFP4 a nivel de operador (en V100 ambos van por kernels custom — no hay FP4 tensor cores; NVFP4 se decodifica a FP16/FP32 igual). (2) En alta concurrencia NO hay datos GGUF: toda la ingenieria de concurrencia del release (DFlash2 C4/C8 #697, mixed-prefill #860, sampler sin syncs, verificacion conjunta) es NVFP4; el GGUF release-wheel es target-only sin spec verificado y con dequant por request -> hipotesis: pierde mas al subir concurrencia, SIN medicion que lo confirme. (3) El adapter MoE GGUF (35B-A3B) ni esta cualificado.
+
+EXPERIMENTO PROPIO propuesto (cierra la pregunta con datos): misma ventana, mismo base Qwen3.8-27B — NVFP4-BF16-LMHead vs GGUF Q4_K_M (~16-17GB ambos) — single x3 + multi6 + sonda tg128 c1/c4/c8/c16 con el protocolo de gates ya montado.
