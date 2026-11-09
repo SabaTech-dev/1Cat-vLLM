@@ -123,3 +123,9 @@ de un cuant — es una regresión TP2 transversal de la 1.5.2 con causa raiz ide
 - Unit de test recreado con el set COMPLETO de flags de prod (KV e5m2, parsers qwen3/qwen3_coder, batched-tokens 8192, prefix-caching, limit-mm 0) por orden Joker — el fallo persiste: no era configuracion.
 - Comentario anadido a #1465 con esta confirmacion. Unidad aparcada (instalada, arrancable post-fix).
 - Estado: prod TP1 sprint sirviendo en :8009 (KV 226,9K tokens — capacidad 1 @200K full / mixta); decision pendiente del dueno: restaurar TP2 (5 @200K) o mantener el split mientras tanto. Alternativa madura para el Tiel: llama.cpp en :8001 (su familia Ornith ya corre ahi).
+
+
+## ANEXO FINAL (III) 09-nov: causa raiz acotada — vllm._apply_gguf_embedding
+- Con VLLM_USE_AOT_COMPILE=0 Y --enforce-eager (sin dynamo/AOT/graphs): el Tiel sigue crasheando con 'ValueError: uninitialized parameter in vllm._apply_gguf_embedding' -> NO es compile-related: la funcion de la wheel que aplica los embeddings GGUF esta rota en TP1/TP2 para Qwen3.8-family multimodal GGUFs.
+- 3 modos de arranque probados (AOT on / AOT off / eager), 10+ intentos: veredicto definitivo, Tiel NO arrancable en wheel 1.5.2. Comentario publicado en #1465.
+- Estado final del rig: prod coder390 sprint TP1 GPU1 :8009 (health 200, KV E5M2, 226.9K tokens), Tiel aparcado, GPU0 libre.
