@@ -101,3 +101,18 @@ Alcance: un drop-in nuevo (p. ej. `zz-zzzzzzz-v152.conf`) que:
 - Requisito de la ventana: prod parado ~6-8 min (compilación JIT del primer uso incluida).
 
 Fuentes: release page 1CatAI/1Cat-vLLM v1.5.2 · notas EN + PR_INDEX (archivados) · árbol git de la tag (fetch upstream en `/home/joker/repos/1Cat-vLLM`).
+
+
+## ANEXO 09-nov: A/B ejecutado — la wheel NO puede servir nuestro checkpoint (veredicto)
+
+A/B en ventana GPU (BASE medido x2 + 4 intentos de la wheel con gates):
+- **BASE (sprint v1.5.1.dev91+g30dd61ae1, e5m2)**: single 256tok 44,7-44,8 t/s · multi6 207,5-212,1 agregado · prefill ~1000/~5000/~8300 t/s @391/@2065/@5467 · sonda tg128 c1/c4/c8/c16 = 39,0/108,9/161,2/224,2 y 38,9/110,4/164,0/213,8 (repro <4%) · KV 1.083.582 · sniffs OK.
+- **Wheel v1.5.2 + e5m2**: NO ARRANCA — crash determinista 6/6 intentos (30 min): `AttributeError: 'ParallelLMHead' object has no attribute '_layer_execution_policy'` en `linear.py:375 process_weights_after_loading` (camino ModelOpt NVFP4/TurboMind; asignacion de politica en linear.py:489 que ParallelLMHead no ejecuta).
+- **Wheel + E4M3**: mismo error raiz (no era constraint XQA ni dtype — es el lm_head CUANTIZADO de coder390; el checkpoint de referencia Unsloth lo lleva en half y por eso el release no lo ejercita).
+- **256K en wheel**: no testable (no arranca).
+
+**Mecanismo**: el checkpoint de referencia del release (Unsloth) lleva lm_head en half; los checkpoints comunitarios con lm_head cuantizado crashean al proceso de pesos. Nuestro sprint (v1.5.1-era) arranca el mismo checkpoint sin problema.
+
+**Veredicto del gate de upgrade**: FALLA el primer criterio (no sirve el workload) → **NO upgrade**. Prod permanece en sprint Modo A (48h+ validado). Draft del issue upstream: `/srv/qflash/upstream-152-boot-bug-draft-20261109.md` (pendiente GO para publicar).
+
+**Rutas de desbloqueo** (I+D): (a) fix upstream del getattr/policy para lm_head cuantizado; (b) probar el checkpoint Unsloth de referencia en la wheel; (c) parche local de la wheel (medicion, no prod); (d) fork-merge release+sprint cuando exista fix.
