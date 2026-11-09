@@ -56,3 +56,23 @@
 6. **glm47-flash FP8** (T4) — solo si sobra ventana.
 
 Descargas T1-T3: ~18+4+19+7+3 GB ≈ 51GB (cabe en /srv con holgura).
+
+
+## ANEXO 09-nov (II): deep-research de los 5 modelos pedidos por Joker
+
+Soporte GGUF verificado EN la wheel v1.5.2 (grep local): loader + adapters `qwen35` (dense), `qwen35moe` (MoE), `qwen4exp`; cuants soportados por los kernels SM70 GGUF: **Q4_K_M, Q4_0, Q8_0, IQ4_XS/NL, IQ3_S/XXS, IQ2_***; **APEX NO soportado**; MTP-en-GGUF sin manejo explícito (el GGUF+MTP4 fue build dev #940, no release).
+
+| # | Modelo | Arch GGUF | Cuant disponible | ¿Cabe TP2? | Veredicto |
+|---|---|---|---|---|---|
+| 1 | `IsValorum/Qwen3.8-35B-A3B-Distill-...APEX-I-MiniPlus-V2.1-Abliterated-GGUF` | qwen35moe ✓ | **SOLO APEX** (14,7GB, único fichero) + mtp-Q4_0/Q8_0 drafts | Sí (14,7GB) | ⚠️ **Probable rechazo**: cuant APEX no soportado por los kernels; MoE-GGUF además sin cualificar completa en el release. Con mtp-drafts incluidos (sin uso verificado). 104k descargas. |
+| 2 | `bartowski/Jackrong_Qwopus3.8-27B-Coder-Flash-GGUF` | qwen35 ✓ dense (adapter CUALIFICADO) | **menú completo**: Q4_K_M (~16,5GB) ✓, Q4_0 ✓, IQ4_XS ✓, hasta bf16 | Sí | ✅ **VIABLE — top candidate**: coder + vision (mmproj) + tool-use/agents, fresísimo (07-nov). Text-only con limit-mm o con visión activada. |
+| 3 | `IsValorum/Swift-1.5-Qwen3.8-27B-Uncensored-...APEX-I-MiniPlus-V3-GGUF` | qwen35 ✓ | **SOLO APEX** (14,2GB, único fichero) + mmproj-Q8_0 | Sí | ⚠️ Mismo problema de cuant APEX → probable rechazo. Uncensored con MTP en el base (GGUF sin MTP verificable). |
+| 4 | `DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-...NEO-CODER-MAX-MTP-GGUF` | qwen35 ✓ dense | **menú completo + quants MTP dedicados**: `-MTP-Q4_K_M` (~17GB), `-Q4_K_M`, `-MTP-Q8_0`, IQ4_XS… | Sí | ✅ **VIABLE — top candidate**: uncensored heretic, coder+creative+roleplay, multi-stage tuned, 1,5M descargas. Dos modalidades: MTP integrado (soporte en release wheel SIN verificar) o target-only garantizado. |
+| 5 | `BAAI/AREX-2` | — (safetensors BF16, qwen3_5) | BF16 27,36B = **54,7GB** — sin GGUF disponible | ❌ NO cabe (64GB totales menos KV) | ❌ **Descartado hoy**. Modelo agente/deep-research interesante — vigilar si sale GGUF comunitario (un Q4_K_M ~15GB sería viable). |
+
+### Plan de prueba recomendado (ventanas sobre la wheel venv152)
+
+1. **DavidAU `-MTP-Q4_K_M`** (si MTP-GGUF no carga → `-Q4_K_M` target-only): el más alineado con el perfil de prod (uncensored coder + creative).
+2. **Qwopus3.8 Coder-Flash `Q4_K_M`**: coder fresco con visión; probar text-only primero.
+3. **Los dos APEX de IsValorum**: un solo boot de verificación cada uno para documentar el rechazo (y pedir en su repo quants IQ4_XS/Q4_K_M, que sí están soportados).
+4. Bonus: todos son familia Qwen3.8-27B → el draft `incoai/Qwen3.8-27B-DFlash2-GGUF` es compatible como speculative draft (soporte GGUF-draft en release sin verificar — probar tras target-only OK).
