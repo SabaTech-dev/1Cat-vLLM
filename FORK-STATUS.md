@@ -77,3 +77,10 @@ Análisis con `git cherry` contra upstream/main (equivalencia de parche). Excluy
 - Upstream sigue avanzando fuerte en SM70 (E4M3 KV, Q8192 prefill, Mamba grid #645, FP8 KV
   graphs B32) — revisar solapes con clase (ii) antes de cada merge.
 - Benchmarks completos: repo sabatech-sm70-qflash, ROADMAP.md sección SERVING STACK.
+
+> **Regla de ubicación de docs (corrección Joker 09-nov):** TODO lo referente a
+> 1Cat-vLLM (releases, A/B, issues upstream, benchmarks del motor) se documenta en
+> ESTE fork (`/srv/build-1cat/src-v151`, rama de campaña) — NO en `/srv/qflash`,
+> que es el repo de `SabaTech-dev/sabatech-sm70-qflash` (campaña del motor qflash).
+> Qflash conserva sus logs rodantes (CHANGELOG/ROADMAP/FORK-STATUS) como registro
+> de campaña, pero los documentos temáticos 1Cat viven aquí.
