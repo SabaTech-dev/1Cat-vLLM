@@ -129,3 +129,9 @@ de un cuant — es una regresión TP2 transversal de la 1.5.2 con causa raiz ide
 - Con VLLM_USE_AOT_COMPILE=0 Y --enforce-eager (sin dynamo/AOT/graphs): el Tiel sigue crasheando con 'ValueError: uninitialized parameter in vllm._apply_gguf_embedding' -> NO es compile-related: la funcion de la wheel que aplica los embeddings GGUF esta rota en TP1/TP2 para Qwen3.8-family multimodal GGUFs.
 - 3 modos de arranque probados (AOT on / AOT off / eager), 10+ intentos: veredicto definitivo, Tiel NO arrancable en wheel 1.5.2. Comentario publicado en #1465.
 - Estado final del rig: prod coder390 sprint TP1 GPU1 :8009 (health 200, KV E5M2, 226.9K tokens), Tiel aparcado, GPU0 libre.
+
+
+## ANEXO (II) 10-nov: onda de bugs SM70-1.5.2 reportados por la comunidad + Tiel confirmado
+- Comunidad reporta en paralelo: #1430 (DFlash2 0% aceptación), #1403 (27B-FP8 TP4 no arranca en 16GB), #1422 (prefix cache GDN sin hits), #1419 (MambaManager assert spec+async), #1407/#1409 (DFlash2 degenerado T>0), #1220 (TP2 OOM main) — la 1.5.2 está áspera en SM70 y NO estamos solos: nuestro #1465 añade el ángulo TP1/TP2 + NVFP4 + GGUF con causa raíz.
+- Nuestro Tiel GGUF (qwen35moe MoE, UD-IQ4_XS) confirmado con LA MISMA firma que los dense ('VocabParallelEmbedding has no attribute qweight' + uninitialized param) — probado con el set COMPLETO de flags de prod (KV e5m2, parsers, prefix-caching) por orden Joker, y con AOT=0 y --enforce-eager: crash en _apply_gguf_embedding en los 3 modos. Comentario de cross-link publicado en #1465.
+- El Tiel queda APARCADO (unit instalado). Alternativa madura mientras tanto: llama.cpp (su formato nativo; la base Ornith-1.5-35B-A3B ya corre en llama.cpp :8001 en este server).
