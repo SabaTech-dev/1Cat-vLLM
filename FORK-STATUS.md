@@ -136,3 +136,15 @@ Análisis con `git cherry` contra upstream/main (equivalencia de parche). Excluy
 3. **A/B KV e4m3 vs e5m2 en el sprint prod** (mismo tamaño de KV, rutas cualificadas,
    mejor mantisa) — MEDIA, dependiente de 1 y 2.
 4. Limpieza de issues stale propias (#505/#488/#430/#1220) cuando 1-2 aterricen. BAJA.
+
+### Follow-up #1465 (22:00, 11-nov): hipótesis e4m3 REFUTADA — matriz limpia de 4 legs
+
+Ventana GPU controlada (trap+gates, logs en `legs-v152-evidencia/window-e4m3-11nov/`):
+wheel 1.5.2 release, TP2, coder390/NVFP4/W4A16 → **crash `_layer_execution_policy`
+idéntico en e4m3-mínimo, e4m3-flags-prod, e5m2-mínimo y perfil oficial completo
+(`sm70_profiles` + FLASH_ATTN_V100 + mamba align + partial-prefix-cache) con overrides TP2**.
+Deltas restantes frente a los 3 boots externos (gelim/#1483/#1424): línea de build
+(main post-#1478 `dev1804` vs wheel release 06-nov), variante de checkpoint
+(unsloth/AWQ-ct/QUASAR vs coder390 W4A16), SXM2+NVLink vs PCIe.
+Publicado en #1465 (comentario 6808152183) con tabla de legs y preguntas a gelim
+(--version + modelo exacto). Prod restaurada sana tras cada ventana.
