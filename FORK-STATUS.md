@@ -84,3 +84,55 @@ Análisis con `git cherry` contra upstream/main (equivalencia de parche). Excluy
 > que es el repo de `SabaTech-dev/sabatech-sm70-qflash` (campaña del motor qflash).
 > Qflash conserva sus logs rodantes (CHANGELOG/ROADMAP/FORK-STATUS) como registro
 > de campaña, pero los documentos temáticos 1Cat viven aquí.
+
+---
+
+## BARRIDO UPSTREAM — SWEEP 2026-11-11 (ventana 08-nov → 11-nov)
+
+> Corrección de premisa: el checkout de docs de esta campaña es `/srv/build-1cat/src-v151`
+> (rama `retest/v1.5.1-fork-merge`), no `/srv/qflash` (campaña anterior). Los bloques
+> de sweep de aquí en adelante viven en este fichero.
+
+### Nuestros PRs/issues upstream (estado real 11-nov)
+
+| Ref | Estado | Movimiento |
+|---|---|---|
+| PR #1322 (fix build SM70) | **MERGED 10-nov** (merge `9b6f88da16`, yangzhuxinyzx lo reparó y aprobó) | el fix build SM70 está en upstream main |
+| PR #431 / #435 | CLOSED 02-oct | contenido absorbido por upstream; FORK-STATUS de 18-sep quedaba desactualizado |
+| Issue #1465 (1.5.2 wheel TP1/TP2 crashes) | OPEN — **primer datapoint externo**: @gelim corre NVFP4+DFlash2 TP2 bien con el perfil del script (E4M3 KV); #1483 y #1424 (otros autores) también arrancan NVFP4 con `fp8_e4m3`. **Hipótesis refinada**: el crash `_layer_execution_policy` es específico de KV **e5m2** en rutas NVFP4 SM70 (las rutas cualificadas son E4M3, #1424). El crash GGUF `_apply_gguf_embedding` sigue siendo defecto aparte del loader. Triage publicado (comentario 6806493403): re-test NVFP4 con e4m3 pendiente (re-download radixark 23GB) | |
+| Issue #433 (build SM70 roto en main) | OPEN pero **cerrable**: arreglado por #1322 — comentario propuesto (6806493785) | |
+| Issues #505 / #488 / #430 / #1220 | OPEN, sin movimiento desde sep/oct (stale) — candidatas a re-triage o cierre cuando la 1.5.x se estabilice en SM70 | |
+
+### Actividad upstream desde 08-nov (post-release v1.5.2 del 06-nov)
+
+- **#1478 "qwen-tp-unified" MERGED 10-nov** — ola de commits SM70 Qwen TP/MTP: strided GDN
+  output storage, budget de draft candidates, QK fusionado entre head shards, collective
+  fusion en MTP shards, particiones dense head, auditoría de prefill scheduling/PLE.
+  **RELEVANTE**: es la línea exacta de nuestro prod (Qwen3.8-27B TP2) — un build
+  post-#1478 puede cambiar el rendimiento de prod; candidato a re-bench.
+- **#1482 MERGED 11-nov**: DeepSeek-V4.1-Flash nativo PP4×TP4 en 16×V100 — WATCH (no aplica
+  a 2×V100 directamente, pero confirma inversión upstream activa en SM70).
+- Issues nuevas: **#1483** (TP2 KV pool exhaustion mata EngineCore en vez de encolar —
+  RELEVANTE a prod: nuestra KV es 1.08M y servimos concurrentes largos), #1480 FlashStates
+  (WATCH), #1423 TORCHINDUCTOR_CACHE_DIR=/tmp (WATCH menor), #1424 (rutas E4M3 cualificadas
+  solo hasta 262K; Yarn 1M falla — RELEVANTE si jugamos ventanas Yarn).
+- Release vigente: v1.5.2 (06-nov). No hay v1.5.3 todavía.
+
+### Otros repos vigilados
+
+- NVlabs/cutile-rs: sin releases en ventana (última v0.4.0, 25-sep) — NULO.
+- PrismML/llama.cpp: API de releases 404 — **premise correction**: el repo/org exacto hay
+  que re-verificarlo (el dato de FORK-STATUS era de la era qflash).
+- signalnine/q27: push 05-nov, FUERA de ventana (08-nov→11-nov) — NULO para este sweep.
+- arXiv: NULO ×2 queries (toolchain opción 1 disponible: plugin `research_papers` en sesión;
+  queries "speculative decoding KV cache quantization fp8" strict/mes y amplia — 0 resultados).
+
+### Impacto en prioridades
+
+1. **Re-test #1465 con E4M3** (re-download radixark NVFP4 23GB + flags mínimos vs prod) —
+   puede desbloquear NVFP4 en TP2 y refinar el triage upstream. ALTA.
+2. **Re-bench de prod contra un build post-#1478** (ola Qwen TP unified) — posible ganancia
+   decode TP2 sin tocar flags. ALTA (requiere build propio de main).
+3. **A/B KV e4m3 vs e5m2 en el sprint prod** (mismo tamaño de KV, rutas cualificadas,
+   mejor mantisa) — MEDIA, dependiente de 1 y 2.
+4. Limpieza de issues stale propias (#505/#488/#430/#1220) cuando 1-2 aterricen. BAJA.
