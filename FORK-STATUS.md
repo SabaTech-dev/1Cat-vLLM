@@ -167,3 +167,16 @@ sprint 1.5.1 (que sirve el mismo checkpoint + DFlash2 + e5m2 sin problema).
 La vía de migración futura es: checkpoint **unsloth NVFP4** (formato que la wheel
 procesa bien, incluye `model_mtp.safetensors`) + wheel con fix PCIe (pendiente
 upstream; matriz y preguntas publicadas en #1465, último comentario 6825661374).
+
+### Barrido 12-nov: TP1 discriminador imposible + contribución #1422
+
+- **#1465**: TP1 NO es posible en V100-32GB (OOM de capacidad: 19GB pesos + ~10-12GB
+  workspaces SM70 > 31.73GB, con 8K y 32K) — el hang de profiling solo es alcanzable
+  en TP2. Publicado (comentario final). Queda en manos de maintainers el fix PCIe;
+  ofrecida validación same-day en nuestro rig.
+- **#1422**: contribuido nuestro datapoint — sprint 1.5.1 + GDN híbrido hace hit de
+  prefix cache 86-97% SIN mamba-cache-mode align (comentario 6826745632). Regresión
+  acotada a 1.5.2.
+- **#1490** (nueva, main builds): OOB GDN prefill con align+MTP4, fix conocido por el
+  reporter (STATE_BLOCKS 13→46) — WATCH, no requiere acción nuestra.
+- **#1483**: 0 apariciones de KV exhaustion en 30 días de logs de prod — sin datapoint.
