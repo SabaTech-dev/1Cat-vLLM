@@ -148,3 +148,22 @@ Deltas restantes frente a los 3 boots externos (gelim/#1483/#1424): línea de bu
 (unsloth/AWQ-ct/QUASAR vs coder390 W4A16), SXM2+NVLink vs PCIe.
 Publicado en #1465 (comentario 6808152183) con tabla de legs y preguntas a gelim
 (--version + modelo exacto). Prod restaurada sana tras cada ventana.
+
+### VEREDICTO A/B 1.5.2 (12-nov, ventana eager completa): NO viable en PCIe — hang en profiling pass
+
+Matriz definitiva en wheel 1.5.2 release, TP2, 2×V100-32GB PCIe (logs en
+`legs-v152-evidencia/{ab152-full,ab152-eager}/`):
+
+| Leg | Checkpoint | Variante | Resultado |
+|---|---|---|---|
+| A/B/C/D | coder390 NVFP4 (ModelOpt) | e4m3/e5m2 × flags × perfil oficial | 💥 crash instantáneo en carga (`ParallelLMHead._layer_execution_policy`) |
+| E1b | unsloth NVFP4 | perfil + TP2 | pesos OK (129 s), profiling 200K OK, KV 669K, captura graphs → atasco >35 min |
+| E1/E2/E3 eager | unsloth NVFP4 | DFlash2 / plain / MTP | ⏸️ HANG determinista en `determine_available_memory` (collective_rpc, >10 min, workers sin responder) |
+| E4 | coder390 config-surgery | e4m3 | 💥 `lm_head.weight` ValueError (ModelOpt ≠ llm-compressor: packing de tensores incompatible) |
+
+Correlación hardware: los 3 boots externos documentados (gelim, #1483, #1424) son
+SXM2+NVLink; nuestro PCIe hang-ea en la primera pasada de GPU. Prod queda en el
+sprint 1.5.1 (que sirve el mismo checkpoint + DFlash2 + e5m2 sin problema).
+La vía de migración futura es: checkpoint **unsloth NVFP4** (formato que la wheel
+procesa bien, incluye `model_mtp.safetensors`) + wheel con fix PCIe (pendiente
+upstream; matriz y preguntas publicadas en #1465, último comentario 6825661374).
