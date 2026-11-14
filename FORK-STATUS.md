@@ -180,3 +180,55 @@ upstream; matriz y preguntas publicadas en #1465, último comentario 6825661374)
 - **#1490** (nueva, main builds): OOB GDN prefill con align+MTP4, fix conocido por el
   reporter (STATE_BLOCKS 13→46) — WATCH, no requiere acción nuestra.
 - **#1483**: 0 apariciones de KV exhaustion en 30 días de logs de prod — sin datapoint.
+
+### VEREDICTO A/B DFlash2 en sprint 1.5.1 (13-nov): trade-off cuantificado — prod PERMANECE en throughput-mode, config flippable
+
+Cadena de validación completa (logs en `legs-v152-evidencia/ab-dflash2-13nov/`):
+sprint `1.5.1.dev91+g30dd61ae1` + coder390 + DFlash2 **ARRANCA y sirve** (boot
+240-410 s, `/version` verificado en el cmdline vivo). Condiciones de formato
+descubiertas por la cadena de errores: (1) SIN `--kv-cache-dtype` impuesto —
+los KV scales del checkpoint → `ValueError fp8_e5m2`; (2) lm_head SIN cuantizar
+para el TopK de candidatos — unsloth NVFP4 lo trae FP8 en group_0 → `ValueError`;
+coder390 pasa por su ignore de 260. Lección de entorno re-confirmada: lanzar
+SIEMPRE con el env file de prod (PYTHONPATH al árbol sprint) — sin él el editable
+del venv resuelve el worktree `campaign-upstream-main` (código main-era).
+
+| Métrica | Throughput-mode (prod) | DFlash2 | Δ |
+|---|---|---|---|
+| Single 256t | 44,6 t/s | 72,0 t/s | +62% |
+| Multi6 agregado | 206,6 t/s | 168,1 t/s | -19% |
+| KV pool | 1.083.582 tokens | 343.214 tokens | -68% |
+
+El esquema KV nativo del checkpoint (`kv_cache_dtype=auto`) cuesta 3,2× por token.
+Con agentes long-context concurrentes (200K), un pool de 343K rompe el servicio
+(una sola petición de 200K = 58% del pool). Config DFlash2 preservada flippable:
+`mode-throughput.conf.dflash2-20261113` (flip = cp + daemon-reload + restart, ~4 min).
+Prod restaurada y verificada (health 200, KV 1.083.582, smoke OK).
+
+### Barrido 14-nov: RELEASE v1.5.3 (publicada HOY 13:44 UTC) — MTP4 nativo 27B SIN draft model — nueva vía de migración
+
+- **MTP4 nativo para 27B**: `--speculative-config '{"method": "mtp", "num_speculative_tokens": 4}'`
+  — sin draft model, todas las rutas de aceleración automáticas. Upstream (relojes
+  default 877 MHz / 300 W — NO comparables 1:1 con nuestro rig 200 W / 2×V100 PCIe):
+  MTP4 single 293 / 8-conc 1072 / **KV 1.598.295 (+22% vs DFlash2 1.308.270)**;
+  DFlash2 single 426 / 8-conc 1120; Flash-Next+MTP4 single 224 / 8-conc 584;
+  multi-request por paso: MTP4 28,4 ms vs DFlash2 42,2 ms (8K×8).
+- **Elimina el trade-off del DFlash2 que medimos el 13-nov**: especulación SIN
+  draft externo y con KV MAYOR, no menor. Nuestro checkpoint unsloth ya trae
+  `model_mtp.safetensors`.
+- Ola SM70 dentro de la release: E4M3-q8 legacy route (#1505), grouped-verify
+  48-row q6-q8, Flash-Next tail checkpoints (#1500), capability checks trazables
+  en modelos compilados (#1498), bare-serve GDN split-copy (#1496),
+  encoder-cache-spec (#1494). PRs abiertos: #1513 (Marlin helpers), #1508 (fused
+  GDN verify), #1507 (Marlin bias SM70), #1501 (MTP HC prefill fuera del grafo).
+- Nuestros issues: **#1465 OPEN** (12 comentarios, última 12-nov) · **#433 OPEN**
+  (3, 11-nov) — 72 h sin movimiento de maintainers. **Implicación #1465**: los
+  fixes de capability/compiled-models de la 1.5.3 son candidatos directos a curar
+  el hang PCIe de profiling; procede comentar en la issue y ofrecer validación
+  same-day con la matriz.
+- Fork propio: issues deshabilitadas (0 abiertas ✓); pushes 18-sep (esperado).
+- Nulls: q27 sin push en ventana (v0.14.8 Latest 05-nov, ya conocida);
+  PrismML/llama.cpp 404 (sucesor PrismML-Eng vivo, línea cerrada); cutile-rs
+  v0.4.0 archivado. Papers: Agrawal et al. "On Evaluating Performance of LLM
+  Inference Systems" (10-nov, DOI 10.1145/3815789.3827963) — RELEVANTE para el
+  protocolo de bench del re-test (valida multi-fase; sugiere métricas extra).
